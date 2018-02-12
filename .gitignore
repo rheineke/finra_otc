@@ -102,3 +102,6 @@ ENV/
 
 # IDEA PyCharm files
 .idea
+
+# Project files and folders
+data/
