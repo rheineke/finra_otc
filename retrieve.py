@@ -9,7 +9,7 @@ import requests
 
 BASE_URL = 'https://otctransparency.finra.org'
 
-CATEGORY = 'category'
+CATEGORY = 'Category'
 DOWNLOAD = 'Download'
 LAST_UPDATED = 'Last Updated'
 REPORT_TYPE = 'Report Type'
@@ -77,7 +77,12 @@ def main(parser_args=None):
 
     iterations = last_updated_mask.sum()
     pbar = pyprind.ProgBar(
-        iterations=iterations, title='OTC Data ({} items)'.format(iterations)
+        iterations=iterations,
+        title='OTC Data ({:%Y-%m-%d} - {:%Y-%m-%d}: {} items)'.format(
+            earliest_updated_dt,
+            dt.date.today(),
+            iterations
+        )
     )
     file_fmt = '{:%Y-%m-%d}_{}_{}_{:%Y-%m-%d %H:%M:%S}.csv'
     base_fmt = 'data/{}'
