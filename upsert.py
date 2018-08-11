@@ -1,11 +1,13 @@
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import pyprind
 import sqlalchemy as sa
 import pandas as pd
 
-from retrieve import CATEGORY, WEEK
+from sql import OTC_DATA, FINRA, CATEGORY, WEEK, REPORT_TYPE, SYMBOL, \
+    VENUE_DESCRIPTION
 
 
 def year_string(v):
@@ -35,13 +37,18 @@ def read_frame(path):
     df[WEEK] = pd.Timestamp(week_str)
     df[CATEGORY] = category
 
+    df.rename(
+        columns={
+            'ATS_Description': VENUE_DESCRIPTION,
+            'OTC_Non-ATS_Description': VENUE_DESCRIPTION,
+        },
+        inplace=True
+    )
+
+    index = [WEEK, CATEGORY, REPORT_TYPE, SYMBOL, VENUE_DESCRIPTION]
+    df.set_index(index, inplace=True)
+
     return df
-
-
-def read_frames(path):
-    iterator = iterdata(path)
-    for p in iterator:
-        yield read_frame(p)
 
 
 def count_files(path):
@@ -55,6 +62,12 @@ def iterdata(path):
                 yield f
 
 
+def insert_frame(path):
+    engine = sa.create_engine('mysql+pymysql://rheineke:password@localhost')
+    df = read_frame(path)
+    df.to_sql(name=OTC_DATA, con=engine, schema=FINRA, if_exists='append')
+
+
 if __name__ == '__main__':
     data_path = Path('data')
 
@@ -63,19 +76,16 @@ if __name__ == '__main__':
         iterations=iterations, title='{} files'.format(iterations)
     )
 
-    cols = [
-        'Report_Type',
-        'Symbol',
-        'Issue_Description',
-        'ATS_Description',
-        'ATS_MPID',
-        'OTC_Non-ATS_Description'
-    ]
-    max_len = defaultdict(int)
-    iterator = read_frames(data_path)
-    for df in iterator:
-        for c in cols:
-            if c in df.columns:
-                max_len[c] = max(max_len[c], max(df[c].apply(len)))
-        pbar.update()
-    # sa.create_engine('postgresql://scott:tiger@localhost/test')
+    futures = []
+    with ProcessPoolExecutor() as executor:
+        for path in iterdata(data_path):
+            future = executor.submit(insert_frame, path)
+            futures.append(future)
+
+        for future in as_completed(futures):
+            pbar.update()
+
+    num_exceptions = 0
+    for future in futures:
+        if future.exception() is not None:
+            num_exceptions += 1

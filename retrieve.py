@@ -7,13 +7,13 @@ import pandas as pd
 import pyprind
 import requests
 
+from sql import CATEGORY, WEEK
+
 BASE_URL = 'https://otctransparency.finra.org'
 
-CATEGORY = 'Category'
 DOWNLOAD = 'Download'
 LAST_UPDATED = 'Last Updated'
 REPORT_TYPE = 'Report Type'
-WEEK = 'Week'
 YEAR = 'Year'
 
 
