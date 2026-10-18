@@ -1,14 +1,10 @@
-from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-import pyprind
-import sqlalchemy as sa
 import pandas as pd
+import sqlalchemy as sa
 from distributed import Client, progress
 
-from sql import OTC_DATA, FINRA, CATEGORY, WEEK, REPORT_TYPE, SYMBOL, \
-    VENUE_DESCRIPTION
+from sql import CATEGORY, FINRA, OTC_DATA, REPORT_TYPE, SYMBOL, VENUE_DESCRIPTION, WEEK
 
 
 def year_string(v):
@@ -20,19 +16,16 @@ def year_string(v):
 
 
 def parse_filename(path):
-    return tuple(path.name.split('_'))
+    return tuple(path.name.split("_"))
 
 
 def read_frame(path):
     df = pd.read_csv(
         filepath_or_buffer=path,
-        sep='|',
-        engine='python',
+        sep="|",
+        engine="python",
         skipfooter=1,
-        parse_dates=[
-            'Shares_Last_Updated',
-            'Trades_Last_Updated'
-        ]
+        parse_dates=["Shares_Last_Updated", "Trades_Last_Updated"],
     )
     week_str, category, _, _ = parse_filename(path)
     df[WEEK] = pd.Timestamp(week_str)
@@ -40,10 +33,10 @@ def read_frame(path):
 
     df.rename(
         columns={
-            'ATS_Description': VENUE_DESCRIPTION,
-            'OTC_Non-ATS_Description': VENUE_DESCRIPTION,
+            "ATS_Description": VENUE_DESCRIPTION,
+            "OTC_Non-ATS_Description": VENUE_DESCRIPTION,
         },
-        inplace=True
+        inplace=True,
     )
 
     index = [WEEK, CATEGORY, REPORT_TYPE, SYMBOL, VENUE_DESCRIPTION]
@@ -59,18 +52,17 @@ def count_files(path):
 def iterdata(path):
     for d in path.iterdir():
         if year_string(d.name):
-            for f in d.iterdir():
-                yield f
+            yield from d.iterdir()
 
 
 def insert_frame(path):
-    engine = sa.create_engine('mysql+pymysql://rheineke:password@localhost')
+    engine = sa.create_engine("mysql+pymysql://rheineke:password@localhost")
     df = read_frame(path)
-    df.to_sql(name=OTC_DATA, con=engine, schema=FINRA, if_exists='append')
+    df.to_sql(name=OTC_DATA, con=engine, schema=FINRA, if_exists="append")
 
 
-if __name__ == '__main__':
-    data_path = Path('data')
+if __name__ == "__main__":
+    data_path = Path("data")
 
     client = Client()
 
