@@ -5,6 +5,7 @@ from pathlib import Path
 import pyprind
 import sqlalchemy as sa
 import pandas as pd
+from distributed import Client, progress
 
 from sql import OTC_DATA, FINRA, CATEGORY, WEEK, REPORT_TYPE, SYMBOL, \
     VENUE_DESCRIPTION
@@ -71,21 +72,8 @@ def insert_frame(path):
 if __name__ == '__main__':
     data_path = Path('data')
 
-    iterations = count_files(data_path)
-    pbar = pyprind.ProgBar(
-        iterations=iterations, title='{} files'.format(iterations)
-    )
+    client = Client()
 
-    futures = []
-    with ProcessPoolExecutor() as executor:
-        for path in iterdata(data_path):
-            future = executor.submit(insert_frame, path)
-            futures.append(future)
+    futures = client.map(insert_frame, [iterdata(data_path)])
 
-        for future in as_completed(futures):
-            pbar.update()
-
-    num_exceptions = 0
-    for future in futures:
-        if future.exception() is not None:
-            num_exceptions += 1
+    progress(futures)
