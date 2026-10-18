@@ -31,12 +31,13 @@ def finra_otc_table(metadata):
 def main():
     engine = sa.create_engine('mysql+pymysql://rheineke:password@localhost')
 
-    engine.execute('CREATE SCHEMA IF NOT EXISTS ' + FINRA)
+    with engine.begin() as conn:
+        conn.execute(sa.text('CREATE SCHEMA IF NOT EXISTS ' + FINRA))
 
-    md = sa.MetaData(bind=engine, schema=FINRA)
+    md = sa.MetaData(schema=FINRA)
     finra_otc_table(md)
-    md.drop_all()
-    md.create_all()
+    md.drop_all(engine)
+    md.create_all(engine)
 
 
 if __name__ == '__main__':

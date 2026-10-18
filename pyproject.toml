@@ -1,0 +1,39 @@
+[project]
+name = "finra-otc"
+version = "0.1.0"
+description = "Retrieve FINRA OTC Transparency Data"
+readme = "README.md"
+requires-python = ">=3.14.8"
+dependencies = [
+    "beautifulsoup4>=4.13",
+    "distributed>=2026.1",
+    "lxml>=6.1",
+    "pandas>=3.0",
+    "pymysql>=1.1",
+    "pyprind>=2.11",
+    "requests>=2.32",
+    "sqlalchemy>=2.1",
+]
+
+[project.optional-dependencies]
+dev = ["ipdb", "mypy", "ruff"]
+test = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["retrieve.py", "upsert.py", "sql.py"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+python_files = ["*_test.py"]
