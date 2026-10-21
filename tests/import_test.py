@@ -6,8 +6,7 @@ import pytest
 
 MODULES = [
     "retrieve",
-    "sql",
-    "upsert",
+    "to_parquet",
 ]
 
 
