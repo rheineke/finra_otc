@@ -5,10 +5,10 @@ from pathlib import Path
 
 import bs4 as bs
 import pandas as pd
-import pyprind
 import requests
+from tqdm import tqdm
 
-from sql import CATEGORY, WEEK
+from to_parquet import CATEGORY, WEEK
 
 BASE_URL = "https://otctransparency.finra.org"
 
@@ -76,17 +76,15 @@ def main(parser_args=None):
 
     last_updated_mask = grid_df[LAST_UPDATED] >= earliest_updated_dt
 
-    iterations = last_updated_mask.sum()
-    pbar = pyprind.ProgBar(
-        iterations=iterations,
-        title=(
-            f"OTC Data ({earliest_updated_dt:%Y-%m-%d} - "
-            f"{dt.date.today():%Y-%m-%d}: {iterations} items)"
-        ),
+    pbar = tqdm(
+        grid_df.loc[last_updated_mask].iterrows(),
+        total=int(last_updated_mask.sum()),
+        desc=f"OTC data updated since {earliest_updated_dt:%Y-%m-%d}",
+        unit="file",
     )
     file_fmt = "{:%Y-%m-%d}_{}_{}_{:%Y-%m-%d %H:%M:%S}.csv"
     base_fmt = "data/{}"
-    for _, srs in grid_df.loc[last_updated_mask].iterrows():
+    for _, srs in pbar:
         base_path = Path(base_fmt.format(srs[YEAR]))
         if not base_path.exists():
             base_path.mkdir(parents=True, exist_ok=True)
@@ -99,7 +97,7 @@ def main(parser_args=None):
             download_result = session.get(BASE_URL + srs[DOWNLOAD])
             with open(file_path, "w") as fp:
                 fp.write(download_result.text)
-        pbar.update(item_id=file_path)
+        pbar.set_postfix_str(file_path.name)
 
 
 if __name__ == "__main__":

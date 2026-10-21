@@ -3,11 +3,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
-import sqlalchemy as sa
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
 
 import retrieve
-import sql
-import upsert
+import to_parquet
 
 GRID = """
 <table>
@@ -20,13 +21,18 @@ GRID = """
 </table>
 """
 
-WEEKLY = """\
-Symbol|Issue_Description|ATS_Description|ATS_MPID|Report_Type|Shares|\
+ATS_FILE = """\
+Report_Type|Symbol|Issue_Description|ATS_Description|ATS_MPID|Shares|\
 Shares_Last_Updated|Trades|Trades_Last_Updated
-AAPL|Apple Inc.|SOME ATS|ABCD|T1|1000|2026-10-14|10|2026-10-14
-MSFT|Microsoft Corp.|SOME ATS|ABCD|T1|2000|2026-10-14|20|2026-10-14
-Total|||||3000||30|
-"""
+NMS Tier 1|AAPL|Apple Inc.|SOME ATS|ABCD|1000|28-JUL-14|10|28-JUL-14
+NMS Tier 1|MSFT|Microsoft Corp.|SOME ATS|ABCD|2000|2014-07-29|20|2014-07-29
+2"""
+
+OTC_FILE = """\
+Report_Type|Symbol|Issue_Description|OTC_Non-ATS_Description|Shares|\
+Shares_Last_Updated|Trades|Trades_Last_Updated
+OTCE|AABB|Asia Broadband Inc|De Minimis Firms|468069|06-AUG-18|41|06-AUG-18
+1"""
 
 
 class FakeSession:
@@ -47,14 +53,14 @@ def test_grid_url():
 
 def test_read_grid_frame_reads_both_categories():
     df = retrieve.read_grid_frame(FakeSession())
-    assert list(df[sql.CATEGORY]) == ["ATS", "ATS", "OTC", "OTC"]
+    assert list(df[to_parquet.CATEGORY]) == ["ATS", "ATS", "OTC", "OTC"]
     assert list(df[retrieve.DOWNLOAD]) == [
         "/files/ATS/1",
         "/files/ATS/2",
         "/files/OTC/1",
         "/files/OTC/2",
     ]
-    assert df[sql.WEEK].iloc[0] == pd.Timestamp("2026-10-05")
+    assert df[to_parquet.WEEK].iloc[0] == pd.Timestamp("2026-10-05")
     assert df[retrieve.LAST_UPDATED].iloc[1] == pd.Timestamp("2026-10-07 09:30")
 
 
@@ -64,44 +70,89 @@ def test_parser_reads_date():
 
 
 def test_year_string():
-    assert upsert.year_string("2026")
-    assert not upsert.year_string("tmp")
+    assert to_parquet.year_string("2026")
+    assert not to_parquet.year_string("tmp")
+
+
+def write(folder, name, text):
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / name
+    path.write_text(text)
+    return path
 
 
 def test_iterdata_skips_non_year_folders(tmp_path):
     for folder, name in [("2025", "a.csv"), ("2026", "b.csv"), ("misc", "c.csv")]:
-        (tmp_path / folder).mkdir()
-        (tmp_path / folder / name).touch()
-    assert sorted(p.name for p in upsert.iterdata(tmp_path)) == ["a.csv", "b.csv"]
-    assert upsert.count_files(tmp_path) == 2
+        write(tmp_path / folder, name, "")
+    names = sorted(p.name for p in to_parquet.iterdata(tmp_path))
+    assert names == ["a.csv", "b.csv"]
 
 
-def test_read_frame_indexes_rows_and_drops_footer(tmp_path):
-    path = Path(tmp_path, "2026-10-05_ATS_T1_2026-10-14 10:00:00.csv")
-    path.write_text(WEEKLY)
-    df = upsert.read_frame(path)
-    assert df.index.names == [
-        sql.WEEK,
-        sql.CATEGORY,
-        sql.REPORT_TYPE,
-        sql.SYMBOL,
-        sql.VENUE_DESCRIPTION,
+def test_parse_filename():
+    path = Path("2014-06-23_ATS_NMS Tier 1_2015-10-07 00:00:00.csv")
+    assert to_parquet.parse_filename(path) == (
+        dt.date(2014, 6, 23),
+        "ATS",
+        "NMS Tier 1",
+        dt.datetime(2015, 10, 7),
+    )
+
+
+def test_latest_files_keep_the_newest_version_of_each_week():
+    names = [
+        "2014-06-30_ATS_OTC_2015-10-07 00:00:00.csv",
+        "2014-06-23_ATS_OTC_2015-12-04 00:00:00.csv",
+        "2014-06-23_ATS_OTC_2015-10-07 00:00:00.csv",
+        "2014-06-23_OTC_OTC_2015-10-07 00:00:00.csv",
     ]
-    assert list(df.index.get_level_values(sql.SYMBOL)) == ["AAPL", "MSFT"]
-    assert df["Shares"].sum() == 3000
-    assert df.index[0][:2] == (pd.Timestamp("2026-10-05"), "ATS")
-
-
-def test_otc_table_creates_with_composite_key():
-    engine = sa.create_engine("sqlite://")
-    md = sa.MetaData()
-    table = sql.finra_otc_table(md)
-    md.create_all(engine)
-    assert [c.name for c in table.primary_key] == [
-        sql.WEEK,
-        sql.CATEGORY,
-        sql.REPORT_TYPE,
-        sql.SYMBOL,
-        sql.VENUE_DESCRIPTION,
+    assert [p.name for p in to_parquet.latest_files(map(Path, names))] == [
+        names[1],
+        names[3],
+        names[0],
     ]
-    assert sa.inspect(engine).has_table(sql.OTC_DATA)
+
+
+def test_read_table_ats_file(tmp_path):
+    path = write(
+        tmp_path, "2014-07-21_ATS_NMS Tier 1_2015-09-28 00:00:00.csv", ATS_FILE
+    )
+    table = to_parquet.read_table(path)
+    assert table.schema == to_parquet.SCHEMA
+    rows = table.to_pylist()
+    assert [r[to_parquet.SYMBOL] for r in rows] == ["AAPL", "MSFT"]  # no footer
+    first = rows[0]
+    assert first[to_parquet.WEEK] == dt.date(2014, 7, 21)
+    assert first[to_parquet.CATEGORY] == "ATS"
+    assert first[to_parquet.VENUE_DESCRIPTION] == "SOME ATS"
+    assert first["Shares_Last_Updated"] == dt.date(2014, 7, 28)
+    assert rows[1]["Trades_Last_Updated"] == dt.date(2014, 7, 29)
+    assert sum(r["Shares"] for r in rows) == 3000
+
+
+def test_read_table_otc_file_has_no_mpid(tmp_path):
+    path = write(tmp_path, "2018-07-02_OTC_OTC_2018-08-10 00:00:00.csv", OTC_FILE)
+    (row,) = to_parquet.read_table(path).to_pylist()
+    assert row[to_parquet.VENUE_DESCRIPTION] == "De Minimis Firms"
+    assert row["ATS_MPID"] is None
+    assert row["Shares"] == 468069
+
+
+def test_read_table_rejects_malformed_rows(tmp_path):
+    bad = ATS_FILE.replace("\n2", "\nnot|a|row")
+    path = write(tmp_path, "2014-07-21_ATS_NMS Tier 1_2015-09-28 00:00:00.csv", bad)
+    with pytest.raises(pa.ArrowInvalid):
+        to_parquet.read_table(path)
+
+
+def test_main_writes_one_parquet_file(tmp_path):
+    data = tmp_path / "data"
+    write(data / "2014", "2014-07-21_ATS_NMS Tier 1_2015-09-28 00:00:00.csv", ATS_FILE)
+    write(data / "2014", "2014-07-21_ATS_NMS Tier 1_2015-10-07 00:00:00.csv", ATS_FILE)
+    write(data / "2018", "2018-07-02_OTC_OTC_2018-08-10 00:00:00.csv", OTC_FILE)
+    out = tmp_path / "otc.parquet"
+    to_parquet.main(["--data", str(data), "--out", str(out)])
+    table = pq.read_table(out)
+    assert table.schema == to_parquet.SCHEMA
+    assert table.num_rows == 3  # the older 2014 version is skipped
+    assert pq.ParquetFile(out).num_row_groups == 2
+    assert not out.with_name("otc.parquet.tmp").exists()
