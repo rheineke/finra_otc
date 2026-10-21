@@ -1,5 +1,6 @@
 import argparse
 import datetime as dt
+import io
 from pathlib import Path
 
 import bs4 as bs
@@ -28,7 +29,7 @@ def read_grid_frame(session):
     grid_dfs = []
     for cat in ["ATS", "OTC"]:
         grid_result = session.get(grid_url(cat))
-        dfs = pd.read_html(io=grid_result.text)
+        dfs = pd.read_html(io.StringIO(grid_result.text))
         assert len(dfs) == 1
         df = dfs[0]
         df.columns = [c.strip() for c in df.columns]
