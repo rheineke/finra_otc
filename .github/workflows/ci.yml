@@ -16,4 +16,6 @@ jobs:
       - run: pip install -e ".[dev,test]"
       - run: ruff check .
       - run: ruff format --check .
+      - run: mypy .
+      - run: codespell
       - run: pytest
