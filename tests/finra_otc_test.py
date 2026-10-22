@@ -156,3 +156,31 @@ def test_main_writes_one_parquet_file(tmp_path):
     assert table.num_rows == 3  # the older 2014 version is skipped
     assert pq.ParquetFile(out).num_row_groups == 2
     assert not out.with_name("otc.parquet.tmp").exists()
+
+
+class DownloadSession(FakeSession):
+    def __init__(self):
+        self.downloads = []
+
+    def get(self, url):
+        if "/files/" in url:
+            self.downloads.append(url)
+            return SimpleNamespace(text=f"contents of {url}")
+        return super().get(url)
+
+
+def test_main_downloads_updated_files_once(tmp_path, monkeypatch, capsys):
+    session = DownloadSession()
+    monkeypatch.setattr(retrieve, "initialize_session", lambda: session)
+    monkeypatch.chdir(tmp_path)
+    existing = Path("data/2026/2026-10-05_OTC_T1_2026-10-14 10:00:00.csv")
+    existing.parent.mkdir(parents=True)
+    existing.write_text("already here")
+
+    retrieve.main(["2026-10-10"])  # only the rows updated on 10/14
+
+    assert session.downloads == [retrieve.BASE_URL + "/files/ATS/1"]
+    saved = Path("data/2026/2026-10-05_ATS_T1_2026-10-14 10:00:00.csv")
+    assert saved.read_text() == "contents of " + retrieve.BASE_URL + "/files/ATS/1"
+    assert existing.read_text() == "already here"
+    assert "2/2" in capsys.readouterr().err  # tqdm counted both files
