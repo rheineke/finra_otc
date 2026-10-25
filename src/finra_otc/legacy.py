@@ -111,6 +111,7 @@ def import_legacy(
     progress: Callable[[str], None] = lambda _: None,
 ) -> ImportResult:
     """Copy legacy files into the raw store."""
+    store.sweep(SOURCE)
     latest = store.latest(SOURCE)
     result = ImportResult()
     for path in legacy_files(folder):

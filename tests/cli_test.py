@@ -26,3 +26,15 @@ def test_unknown_build_part_is_an_error(tmp_path: Path) -> None:
 def test_monthly_needs_since() -> None:
     with pytest.raises(SystemExit):
         cli.get_parser().parse_args(["capture", "regsho-monthly"])
+
+
+def test_build_dataset_builds_only_the_api_part(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from finra_otc.raw import RawStore
+
+    store = RawStore(tmp_path)
+    store.save("cdn/regsho_daily", "x", [("x.txt", b"bad", {})],
+               meta={"facility": "CNMS", "date": "2026-10-22"})  # fmt: skip
+    assert cli.main(["--data", str(tmp_path), "build", "--dataset", "regShoDaily"]) == 0
+    assert cli.main(["--data", str(tmp_path), "build"]) == 1  # the daily part runs

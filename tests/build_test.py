@@ -400,3 +400,29 @@ def test_line_breaks_in_quoted_values_survive_big_pages(tmp_path: Path) -> None:
     store.save("api/weeklySummary", "k", files, meta={"record_total": 30_000}, now=NOW)
     [r] = build.build_api(store, ["weeklySummary"])
     assert (r.built, r.rows) == (1, 30_000), r.errors
+
+
+def test_a_damaged_metadata_copy_is_skipped_when_another_is_intact(
+    tmp_path: Path,
+) -> None:
+    store = RawStore(tmp_path)
+    save_catalog(store, "weeklySummary", METADATA)
+    first = store.latest("api_catalog/weeklySummary")["metadata"]
+    store.path(first.files[0]).write_bytes(b"rot")
+    # The next capture saved a fresh copy of the same version.
+    content = json.dumps(METADATA).encode()
+    files: list[tuple[str, bytes, dict[str, Any]]] = [("metadata.json", content, {})]
+    later = NOW.replace(hour=17)
+    store.save("api_catalog/weeklySummary", "metadata", files, now=later)
+    save_partition(store, "weeklySummary", "k", [PAGE])
+    [r] = build.build_api(store, ["weeklySummary"])
+    assert (r.built, r.failed) == (1, 0), r.errors
+
+
+def test_force_rebuilds_current_outputs(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    save_catalog(store, "weeklySummary", METADATA)
+    save_partition(store, "weeklySummary", "k", [PAGE])
+    build.build_api(store, ["weeklySummary"])
+    assert build.build_api(store, ["weeklySummary"])[0].current == 1
+    assert build.build_api(store, ["weeklySummary"], force=True)[0].built == 1

@@ -1,4 +1,5 @@
 import json
+import threading
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -354,3 +355,45 @@ def test_catalog_ignores_request_ids(tmp_path: Path) -> None:
         c for c in store.captures("api_catalog/weeklySummary") if c.key == "partitions"
     ]
     assert len(partitions) == 1
+
+
+def test_metadata_without_fields_is_refused(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    client = catalog_client(rows(1))
+    url = api.metadata_url("weeklySummary")
+    body = {"statusCode": 200, "message": "try later", "requestId": "x"}
+    js = {"Content-Type": "application/json"}
+    client.routes[url] = response(url, json.dumps(body).encode(), headers=js)
+    with pytest.raises(api.CaptureError, match="no field list"):
+        api.capture_catalog(client, store, "weeklySummary", NOW)
+    assert store.latest("api_catalog/weeklySummary") == {}
+
+
+def test_partition_values_follow_the_answers_own_field_order(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    client = catalog_client(rows(1))
+    url = api.partitions_url("weeklySummary")
+    answer = {
+        "partitionFields": ["tierIdentifier", "weekStartDate"],
+        "availablePartitions": [{"partitions": ["T1", "2026-09-14"]}],
+    }
+    js = {"Content-Type": "application/json"}
+    client.routes[url] = response(url, json.dumps(answer).encode(), headers=js)
+    _, partitions = api.capture_catalog(client, store, "weeklySummary", NOW)
+    assert partitions == [["2026-09-14", "T1"]]
+
+
+def test_a_stopped_capture_abandons_fetches_in_flight() -> None:
+    stop = threading.Event()
+    stop.set()
+    client = FakeClient(posts={api.data_url("weeklySummary"): pager(rows(7))})
+    with pytest.raises(api.Stopped):
+        api.fetch_partition(client, WEEKLY, FIELDS, VALUES, stop)
+    assert client.calls == []
+
+
+def test_values_over_csvs_default_field_limit() -> None:
+    big = "x" * 200_000
+    page = f'"a"\n"{big}"\n'.encode()
+    assert api.parse_page(page) == (["a"], 1)
+    assert api.csv_rows(page) == [{"a": big}]

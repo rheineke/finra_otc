@@ -14,9 +14,10 @@ expected number of rows, and the same ``record-total`` on every page.
 import csv
 import io
 import json
-from collections import deque
+import sys
+import threading
 from collections.abc import Callable, Iterable, Mapping
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -33,6 +34,9 @@ CSV = "text/plain"
 MAX_PAGE = 5000
 MAX_OFFSET = 500_000
 FINRA_TZ = ZoneInfo("America/New_York")
+
+# Values such as the daily list's comments can exceed csv's 128 KiB default.
+csv.field_size_limit(sys.maxsize)
 UNPARTITIONED_KEY = "all"
 
 
@@ -180,6 +184,8 @@ def parse_page(content: bytes) -> tuple[list[str], int]:
 
 
 _File = tuple[str, bytes, Mapping[str, Any]]
+# A fetched partition: its pages, the capture meta, and when the fetch began.
+_Fetched = tuple[list[_File], dict[str, Any], datetime]
 
 
 def fetch_partition(
@@ -187,6 +193,7 @@ def fetch_partition(
     dataset: Dataset,
     fields: list[str],
     values: list[str],
+    stop: threading.Event | None = None,
 ) -> tuple[list[tuple[str, bytes, Mapping[str, Any]]], dict[str, Any]]:
     """Every page of one partition, checked; (files, capture meta)."""
     url = data_url(dataset.name)
@@ -195,6 +202,8 @@ def fetch_partition(
     total: int | None = None
     offset = 0
     while True:
+        if stop is not None and stop.is_set():
+            raise Stopped(f"{dataset.name} {values}: stopped")
         body = query_body(fields, values, dataset.page_size, offset)
         response = client.post_json(url, body, CSV)
         page_total = _record_total(response)
@@ -400,11 +409,16 @@ def _unchanged(store: RawStore, previous: Capture, files: list[_File]) -> bool:
 
 
 def _fetch_with_retries(
-    client: HttpClient, dataset: Dataset, fields: list[str], item: Plan, retries: int
+    client: HttpClient,
+    dataset: Dataset,
+    fields: list[str],
+    item: Plan,
+    retries: int,
+    stop: threading.Event | None = None,
 ) -> tuple[list[tuple[str, bytes, Mapping[str, Any]]], dict[str, Any]]:
     for attempt in range(retries + 1):
         try:
-            return fetch_partition(client, dataset, fields, item.values)
+            return fetch_partition(client, dataset, fields, item.values, stop)
         except PartitionChanged:
             if attempt == retries:
                 raise
@@ -426,19 +440,43 @@ def _saved_json(store: RawStore, capture: Capture) -> Any:
         return None  # damaged: save the fresh copy
 
 
+def check_metadata(dataset: str, metadata: Any) -> None:
+    """Refuse a metadata answer that isn't a field list (an error body, say)."""
+    fields = metadata.get("fields") if isinstance(metadata, dict) else None
+    if not isinstance(fields, list) or not all(
+        isinstance(f, dict) and "name" in f and "type" in f for f in fields
+    ):
+        raise CaptureError(f"{dataset}: metadata has no field list; not saved")
+
+
 def capture_catalog(
     client: HttpClient, store: RawStore, dataset: str, now: datetime
 ) -> tuple[dict[str, Any], list[list[str]]]:
-    """Fetch (and save, when changed) a dataset's metadata and partition list."""
+    """Fetch (and save, when changed) a dataset's metadata and partition list.
+
+    Partition values come back in the order of the answer's own
+    partitionFields; they are returned in the order of the metadata's.
+    """
     source = f"api_catalog/{dataset}"
+    store.sweep(source)
     latest = store.latest(source)
     out: dict[str, Any] = {}
+    responses = {}
     for key, url in (
         ("metadata", metadata_url(dataset)),
         ("partitions", partitions_url(dataset)),
     ):
         response = client.get(url)
         out[key] = _json(response)
+        responses[key] = (url, response)
+    check_metadata(dataset, out["metadata"])
+    fields = out["metadata"].get("partitionFields") or []
+    previous_meta = latest.get("metadata")
+    if previous_meta is not None and not fields:
+        before = _saved_json(store, previous_meta)
+        if isinstance(before, dict) and before.get("partitionFields"):
+            raise CaptureError(f"{dataset}: metadata lost its partition fields")
+    for key, (url, response) in responses.items():
         previous = latest.get(key)
         if previous is None or _saved_json(store, previous) != _stable(
             response.content
@@ -448,9 +486,25 @@ def capture_catalog(
                 (f"{key}.json", response.content, {})
             ]
             store.save(source, key, files, meta=meta, now=now)
-    available = out["partitions"].get("availablePartitions", [])
-    partitions = [p["partitions"] for p in available]
+    answer = out["partitions"]
+    available = answer.get("availablePartitions", []) if fields else []
+    order = answer.get("partitionFields") or fields
+    if sorted(order) != sorted(fields):
+        raise CaptureError(
+            f"{dataset}: partition fields {order} don't match the metadata's {fields}"
+        )
+    partitions = []
+    for p in available:
+        values = p["partitions"]
+        if len(values) != len(order):
+            raise CaptureError(f"{dataset}: partition {values} doesn't match {order}")
+        by_field = dict(zip(order, values, strict=True))
+        partitions.append([by_field[f] for f in fields])
     return out["metadata"], partitions
+
+
+class Stopped(CaptureError):
+    """The capture is shutting down; this fetch was abandoned."""
 
 
 def capture_dataset(
@@ -472,8 +526,6 @@ def capture_dataset(
     fields: list[str] = metadata.get("partitionFields") or []
     if not fields:
         partitions = [[]]
-    elif any(len(p) != len(fields) for p in partitions):
-        raise CaptureError(f"{dataset.name}: partitions don't match {fields}")
     if dataset.details is not None:
         updated = last_updates(details_rows(store, dataset.details), fields)
     else:
@@ -491,60 +543,82 @@ def capture_dataset(
         checks=store.checks(source),
     )
     result = Result(dataset.name, planned=len(todo))
+    stop = threading.Event()
 
-    def fetch(item: Plan) -> tuple[list[_File], dict[str, Any], datetime]:
+    def fetch(item: Plan) -> _Fetched:
         # Stamp captures with when the fetch began: a republish dated that day
         # may have landed while it ran, and the planner must still see it.
         started = now()
-        files, meta = _fetch_with_retries(client, dataset, fields, item, retries)
+        files, meta = _fetch_with_retries(client, dataset, fields, item, retries, stop)
         return files, meta, started
 
-    # Partitions are fetched in parallel and saved in order, by this thread only.
+    # Partitions are fetched in parallel and saved, by this thread only, as each
+    # finishes; at most 2 x workers are in memory at once.
     pool = ThreadPoolExecutor(max_workers=max(1, workers))
     try:
-        window: deque[tuple[Plan, Future[tuple[list[_File], dict[str, Any], datetime]]]]
-        window = deque()
+        running: dict[Future[_Fetched], Plan] = {}
         pending = iter(todo)
         done = 0
         while True:
-            while len(window) < 2 * max(1, workers):
+            while len(running) < 2 * max(1, workers):
                 item = next(pending, None)
                 if item is None:
                     break
-                window.append((item, pool.submit(fetch, item)))
-            if not window:
+                running[pool.submit(fetch, item)] = item
+            if not running:
                 break
-            item, future = window.popleft()
-            done += 1
-            key = partition_key(item.values)
-            label = f"{dataset.name} {done}/{len(todo)} {key}"
-            try:
-                files, meta, started = future.result()
-                previous = latest.get(key)
-                if (
-                    meta["record_total"] == 0
-                    and previous is not None
-                    and previous.meta.get("record_total")
-                ):
-                    raise CaptureError(
-                        f"FINRA lists this partition but returned no rows; it "
-                        f"had {previous.meta['record_total']:,}. Not saved."
-                    )
-            except (CaptureError, HttpError, ValueError, RequestException) as e:
-                result.failed += 1
-                result.errors.append(f"{key}: {e}")
-                progress(f"{label}: FAILED {e}")
-                continue
-            if previous is not None and _unchanged(store, previous, files):
-                result.unchanged += 1
-                store.record_check(source, key, started, reason=item.reason)
-                progress(f"{label}: unchanged")
-                continue
-            meta["reason"] = item.reason
-            store.save(source, key, files, meta=meta, now=started)
-            result.saved += 1
-            progress(f"{label}: {meta['record_total']:,} rows")
+            finished, _ = wait(running, return_when=FIRST_COMPLETED)
+            for future in finished:
+                done += 1
+                item = running.pop(future)
+                counter = f"{dataset.name} {done}/{len(todo)}"
+                _save_result(
+                    store, source, latest, future, item, result, progress, counter
+                )
     finally:
-        # On an error or Ctrl-C, don't keep fetching partitions nobody will save.
+        # On an error or Ctrl-C, stop the fetches in flight at their next page,
+        # and don't start queued ones.
+        stop.set()
         pool.shutdown(wait=True, cancel_futures=True)
     return result
+
+
+def _save_result(
+    store: RawStore,
+    source: str,
+    latest: Mapping[str, Capture],
+    future: Future[_Fetched],
+    item: Plan,
+    result: Result,
+    progress: Callable[[str], None],
+    counter: str,
+) -> None:
+    key = partition_key(item.values)
+    label = f"{counter} {key}"
+    previous = latest.get(key)
+    try:
+        files, meta, started = future.result()
+        if (
+            meta["record_total"] == 0
+            and previous is not None
+            and previous.meta.get("record_total")
+        ):
+            raise CaptureError(
+                f"FINRA lists this partition but returned no rows; it had "
+                f"{previous.meta['record_total']:,}. Not saved, even with "
+                "--refresh-since."
+            )
+    except (CaptureError, HttpError, ValueError, RequestException, csv.Error) as e:
+        result.failed += 1
+        result.errors.append(f"{key}: {e}")
+        progress(f"{label}: FAILED {e}")
+        return
+    if previous is not None and _unchanged(store, previous, files):
+        result.unchanged += 1
+        store.record_check(source, key, started, reason=item.reason)
+        progress(f"{label}: unchanged")
+        return
+    meta["reason"] = item.reason
+    store.save(source, key, files, meta=meta, now=started)
+    result.saved += 1
+    progress(f"{label}: {meta['record_total']:,} rows")

@@ -6,8 +6,8 @@
     parquet/legacy/weekly/<YYYY>.parquet
 
 Each output is built from the newest capture of each of its inputs, and is
-rebuilt only when those inputs or the code that builds them change: a
-fingerprint of both is stored in the file's metadata. Files are written under a
+rebuilt only when those inputs or its builder's version change: a fingerprint
+of both is stored in the file's metadata. Files are written under a
 hidden temporary name (which dataset readers skip) and then renamed. When an
 output can't be built, its old file is removed, so readers never see a table
 that no longer matches the raw store. Read a table with, for example,
@@ -48,10 +48,13 @@ from .raw import Capture, RawStore
 # pyarrow-stubs types these functions too narrowly for string arrays.
 _pc: Any = pc
 
-# Outputs are rebuilt when the code that builds them changes.
-CODE = hashlib.sha256(
-    Path(__file__).read_bytes() + Path(legacy.__file__).read_bytes()
-).hexdigest()
+# Bump a builder's version when a change alters what it writes; its outputs
+# are then rebuilt, and only those. A pyarrow upgrade alone rebuilds nothing:
+# run `finra-otc build --force` if it changes parsing.
+API_VERSION = 1
+DAILY_VERSION = 1
+MONTHLY_VERSION = 1
+LEGACY_VERSION = 1
 FINGERPRINT = b"finra_otc.fingerprint"
 INPUTS = b"finra_otc.inputs"
 
@@ -91,9 +94,9 @@ def parquet_dir(store: RawStore) -> Path:
     return store.root / "parquet"
 
 
-def fingerprint(inputs: Iterable[Capture], extra: Any = None) -> str:
+def fingerprint(inputs: Iterable[Capture], version: int, extra: Any = None) -> str:
     payload = {
-        "code": CODE,
+        "version": version,
         "inputs": [[c.source, c.key, c.captured_at, c.sha256s] for c in inputs],
         "extra": extra,
     }
@@ -141,9 +144,10 @@ def build_one(
     label: str,
     write: Callable[[], int],
     progress: Callable[[str], None],
+    force: bool = False,
 ) -> None:
     """Build one output unless current; ``write`` writes it and returns rows."""
-    if is_current(path, print_):
+    if not force and is_current(path, print_):
         result.current += 1
         return
     try:
@@ -281,28 +285,46 @@ def build_api_partition(
     return table
 
 
-def dataset_schema(store: RawStore, dataset: str) -> pa.Schema:
+def dataset_schema(store: RawStore, dataset: str) -> tuple[pa.Schema, list[str]]:
     """One schema for every file of a dataset: each field FINRA has ever listed.
 
     Each partition's file gets the same columns, null where its capture lacks
     them, so reading the dataset as a directory loses nothing. A field whose
-    type changed between metadata versions fails the dataset.
+    type changed between metadata versions fails the dataset. Returns the
+    schema and warnings about versions that couldn't be read (a damaged file
+    with no intact copy, or an answer without fields); those are skipped.
     """
     found = sorted(
         (c for c in store.captures(f"api_catalog/{dataset}") if c.key == "metadata"),
         key=lambda c: c.captured_at,
     )
-    types: dict[str, pa.DataType] = {}
+    # Each distinct version once, read from any intact copy.
+    versions: dict[str, list[Capture]] = {}
     for capture in found:
-        for f in api_schema(dataset, json.loads(store.read(capture.files[0]))):
+        versions.setdefault(capture.files[0].sha256, []).append(capture)
+    types: dict[str, pa.DataType] = {}
+    warnings = []
+    for sha, copies in versions.items():
+        fields = None
+        for copy in copies:
+            try:
+                fields = api_schema(dataset, json.loads(store.read(copy.files[0])))
+                break
+            except (*BUILD_ERRORS, KeyError, TypeError) as e:
+                problem = f"{copy.files[0].path}: {e}"
+        if fields is None:
+            warnings.append(f"skipped metadata version {sha[:12]}: {problem}")
+            continue
+        for f in fields:
             if f.name in types and types[f.name] != f.type:
                 raise BuildError(
                     f"{f.name} changed type from {types[f.name]} to {f.type}"
                 )
             types.setdefault(f.name, f.type)
     if not types:
-        raise BuildError("no metadata captured")
-    return pa.schema([pa.field(name, t) for name, t in types.items()])
+        raise BuildError("no readable metadata captured")
+    schema = pa.schema([pa.field(name, t) for name, t in types.items()])
+    return schema, warnings
 
 
 def _remove_stale(path: Path, capture: Capture) -> None:
@@ -321,6 +343,7 @@ def build_api(
     store: RawStore,
     datasets: list[str] | None = None,
     progress: Callable[[str], None] = lambda _: None,
+    force: bool = False,
 ) -> list[Result]:
     results = []
     for dataset in datasets or [d.name for d in api.DATASETS]:
@@ -332,7 +355,7 @@ def build_api(
             continue
         out = parquet_dir(store) / "api" / dataset
         try:
-            schema = dataset_schema(store, dataset)
+            schema, warnings = dataset_schema(store, dataset)
         except BUILD_ERRORS as e:
             # Nothing can be built; drop outputs the raw store has moved past.
             for key, capture in captures.items():
@@ -340,11 +363,14 @@ def build_api(
             result.failed += 1
             result.errors.append(f"metadata: {e}")
             continue
+        for warning in warnings:
+            progress(f"{source}: warning: {warning}")
         for key, capture in sorted(captures.items()):
             path = out / f"{key}.parquet"
-            print_ = fingerprint([capture], schema.to_string())
+            print_ = fingerprint([capture], API_VERSION, schema.to_string())
             write = partial(_write_api, store, capture, schema, path, print_)
-            build_one(result, path, print_, f"{source} {key}", write, progress)
+            label = f"{source} {key}"
+            build_one(result, path, print_, label, write, progress, force)
     return results
 
 
@@ -423,7 +449,9 @@ def read_daily(content: bytes, facility: str, what: str) -> pa.Table:
 
 
 def build_daily(
-    store: RawStore, progress: Callable[[str], None] = lambda _: None
+    store: RawStore,
+    progress: Callable[[str], None] = lambda _: None,
+    force: bool = False,
 ) -> Result:
     result = Result(cdn.DAILY_SOURCE)
     groups: dict[tuple[str, str], list[Capture]] = defaultdict(list)
@@ -434,10 +462,10 @@ def build_daily(
         path = (
             parquet_dir(store) / "cdn" / "regsho_daily" / facility / f"{month}.parquet"
         )
-        print_ = fingerprint(captures)
+        print_ = fingerprint(captures, DAILY_VERSION)
         write = partial(_write_daily, store, captures, facility, path, print_)
         label = f"regsho_daily {facility} {month}"
-        build_one(result, path, print_, label, write, progress)
+        build_one(result, path, print_, label, write, progress, force)
     return result
 
 
@@ -547,19 +575,24 @@ def build_monthly_file(
 
 
 def build_monthly(
-    store: RawStore, progress: Callable[[str], None] = lambda _: None
+    store: RawStore,
+    progress: Callable[[str], None] = lambda _: None,
+    force: bool = False,
 ) -> Result:
     result = Result(cdn.MONTHLY_SOURCE)
     for key, capture in sorted(store.latest(cdn.MONTHLY_SOURCE).items()):
         path = parquet_dir(store) / "cdn" / "regsho_monthly" / f"{key}.parquet"
-        print_ = fingerprint([capture])
+        print_ = fingerprint([capture], MONTHLY_VERSION)
         write = partial(build_monthly_file, store, capture, path, print_)
-        build_one(result, path, print_, f"regsho_monthly {key}", write, progress)
+        label = f"regsho_monthly {key}"
+        build_one(result, path, print_, label, write, progress, force)
     return result
 
 
 def build_legacy(
-    store: RawStore, progress: Callable[[str], None] = lambda _: None
+    store: RawStore,
+    progress: Callable[[str], None] = lambda _: None,
+    force: bool = False,
 ) -> Result:
     result = Result(legacy.SOURCE)
     by_year: dict[int, list[Capture]] = defaultdict(list)
@@ -567,9 +600,10 @@ def build_legacy(
         by_year[int(capture.meta["week"][:4])].append(capture)
     for year, captures in sorted(by_year.items()):
         path = parquet_dir(store) / "legacy" / "weekly" / f"{year}.parquet"
-        print_ = fingerprint(captures)
+        print_ = fingerprint(captures, LEGACY_VERSION)
         write = partial(_write_legacy, store, captures, path, print_)
-        build_one(result, path, print_, f"legacy weekly {year}", write, progress)
+        label = f"legacy weekly {year}"
+        build_one(result, path, print_, label, write, progress, force)
     return result
 
 

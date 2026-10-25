@@ -89,17 +89,19 @@ and partition list, saved when they change), `cdn/regsho_daily`,
 Text is gzipped on disk, and ZIPs are stored as-is. Nothing is overwritten:
 when a partition or file changes, the new version is saved next to the old one,
 and the manifest says which is newest. Files are written and synced to disk
-(F_FULLFSYNC on macOS) first and the manifest line last, so an interrupted capture leaves nothing
-half-recorded; each capture command clears out unfinished folders and
-downloads more than a day old. Reads check every file against the SHA-256 in
-the manifest, and a damaged file is replaced the next time the same data is
-fetched. Daily CDN files are checked against their row-count footer before
-they're saved.
+(F_FULLFSYNC on macOS) first and the manifest line last, so an interrupted
+capture leaves nothing half-recorded; each capture command clears out
+unfinished or unrecorded folders and downloads more than a day old. Reads
+check every file against the SHA-256 in the manifest. A damaged file is
+replaced the next time the same data is fetched: on any run for recent data,
+or with `--refresh-since` for older data (monthly ZIPs are only size-checked
+at capture; the build verifies their hash). Daily CDN files are checked
+against their row-count footer before they're saved.
 
 Each Parquet file is built from the newest capture of its inputs and records a
-fingerprint of them and of the build code, so `build` only redoes what
-changed. Read a table as a
-directory:
+fingerprint of them and of its builder's version, so `build` only redoes what
+changed (`--force` rebuilds everything, say after a pyarrow upgrade). Read a
+table as a directory:
 
 ```python
 import pyarrow.parquet as pq
@@ -133,6 +135,7 @@ finra-otc capture regsho-monthly --since 2026-01 --dry-run     # sizes only
 finra-otc capture regsho-monthly --since 2026-01
 finra-otc capture legacy ~/projects/personal/finra_otc/data
 finra-otc build                           # api, regsho-daily, regsho-monthly, legacy
+finra-otc build --dataset weeklySummary   # just that API dataset
 finra-otc status                          # keys, captures and MB per source
 ```
 
@@ -142,10 +145,12 @@ saves only what changed. A partition counts as republished when the
 `*DownloadDetails` datasets date its last update on or after the day it was
 last fetched. Partitions with no details rows (monthly summaries before 2017,
 OTC blocks before late 2019, the oldest historic weeks) are never fetched
-again unless you ask with `--refresh-since`. A full first API
+again unless you ask with `--refresh-since`. The check tolerates FINRA
+updating the details a day before the data; a longer lag would be missed until
+the next republication or a `--refresh-since`. A full first API
 capture is a few GB and takes hours. `weeklySummaryHistoric` is the slow part,
 at about 3 seconds a page; `--workers` (default 4) sets how many partitions
-are fetched at once. A failed partition, file or dataset (including dropped
+are fetched at once, and Ctrl-C stops them at their next page. A failed partition, file or dataset (including dropped
 connections, after retries) is reported and skipped, and the command exits
 with status 1.
 

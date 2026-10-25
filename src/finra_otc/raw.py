@@ -283,15 +283,26 @@ class RawStore:
     def sweep(self, source: str, older_than: timedelta = timedelta(days=1)) -> int:
         """Remove leftovers of interrupted captures; return how many.
 
-        Unfinished capture folders (*.partial) and downloads (.scratch/*) that
-        are older than ``older_than``, so that a running capture keeps its own.
+        These are unfinished capture folders (*.partial), downloads
+        (.scratch/*), and finished capture folders that no manifest line names
+        (a crash between the rename and the manifest append). Only those older
+        than ``older_than`` go, so a capture running alongside keeps its own.
         """
         root = self.source_dir(source)
         if not root.exists():
             return 0
         cutoff = time.time() - older_than.total_seconds()
-        stale = [p for p in root.glob("*/*.partial") if p.stat().st_mtime < cutoff]
-        stale += [p for p in root.glob(".scratch/*") if p.stat().st_mtime < cutoff]
+        recorded = {
+            (self.raw_dir / f.path).parent
+            for c in self.captures(source)
+            for f in c.files
+        }
+        candidates = list(root.glob(".scratch/*"))
+        for folder in root.glob("*/*"):
+            if folder.is_dir() and folder.parent.name != ".scratch":
+                if folder.name.endswith(".partial") or folder not in recorded:
+                    candidates.append(folder)
+        stale = [p for p in candidates if p.stat().st_mtime < cutoff]
         for p in stale:
             if p.is_dir():
                 shutil.rmtree(p, ignore_errors=True)

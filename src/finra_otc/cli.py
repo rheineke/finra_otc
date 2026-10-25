@@ -1,6 +1,7 @@
 """finra-otc: capture FINRA OTC market data, then build Parquet tables."""
 
 import argparse
+import csv
 import sys
 from collections.abc import Sequence
 from datetime import date
@@ -57,6 +58,11 @@ def get_parser() -> argparse.ArgumentParser:
     d = cap.add_parser("regsho-daily", help="daily short-sale volume files (CDN)")
     _date_range(d, "trade date")
     d.add_argument("--facility", action="append", choices=list(cdn.DAILY_FACILITIES))
+    d.add_argument(
+        "--refresh-since",
+        type=_date,
+        help="re-check files dated on or after this (and replace damaged copies)",
+    )
     d.add_argument("--recheck-absent", action="store_true")
 
     m = cap.add_parser(
@@ -66,6 +72,11 @@ def get_parser() -> argparse.ArgumentParser:
     m.add_argument("--since", type=_month, required=True, help="first month, YYYY-MM")
     m.add_argument("--until", type=_month, help="last month, YYYY-MM")
     m.add_argument("--facility", action="append", choices=list(cdn.MONTHLY_FACILITIES))
+    m.add_argument(
+        "--refresh-since",
+        type=_month,
+        help="re-check months from this one, YYYY-MM (and replace damaged copies)",
+    )
     m.add_argument("--recheck-absent", action="store_true")
     m.add_argument(
         "--dry-run", action="store_true", help="list files and sizes; save nothing"
@@ -84,7 +95,15 @@ def get_parser() -> argparse.ArgumentParser:
         metavar="PART",
         help="api, regsho-daily, regsho-monthly or legacy (default: all)",
     )
-    b.add_argument("--dataset", action="append", choices=list(api.BY_NAME))
+    b.add_argument(
+        "--dataset",
+        action="append",
+        choices=list(api.BY_NAME),
+        help="API datasets to build (implies the api part when no part is named)",
+    )
+    b.add_argument(
+        "--force", action="store_true", help="rebuild even outputs that are current"
+    )
 
     sub.add_parser("status", help="what is in the raw store and the Parquet tables")
     return p
@@ -139,6 +158,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     RequestException,
                     OSError,
                     ValueError,
+                    csv.Error,
                 ) as e:
                     # The catalog failed; carry on with the other datasets.
                     print(f"{name}: FAILED", file=sys.stderr)
@@ -157,6 +177,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 until=args.until,
                 facilities=getattr(args, "facility", None),
                 recheck_absent=getattr(args, "recheck_absent", False),
+                refresh_since=getattr(args, "refresh_since", None),
                 progress=progress,
             )
             print(_cdn_summary(d))
@@ -169,6 +190,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 until=args.until,
                 facilities=args.facility,
                 recheck_absent=args.recheck_absent,
+                refresh_since=args.refresh_since,
                 dry_run=args.dry_run,
                 progress=progress,
             )
@@ -182,16 +204,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             failures += _report([f"not a legacy file name: {n}" for n in li.ignored])
     elif args.command == "build":
-        parts = args.parts or BUILD_PARTS
+        parts = args.parts or (["api"] if args.dataset else BUILD_PARTS)
         results: list[build.Result] = []
         if "api" in parts:
-            results += build.build_api(store, args.dataset, progress=progress)
+            results += build.build_api(store, args.dataset, progress, args.force)
         if "regsho-daily" in parts:
-            results.append(build.build_daily(store, progress=progress))
+            results.append(build.build_daily(store, progress, args.force))
         if "regsho-monthly" in parts:
-            results.append(build.build_monthly(store, progress=progress))
+            results.append(build.build_monthly(store, progress, args.force))
         if "legacy" in parts:
-            results.append(build.build_legacy(store, progress=progress))
+            results.append(build.build_legacy(store, progress, args.force))
         for b in results:
             if b.built or b.current or b.failed:
                 print(

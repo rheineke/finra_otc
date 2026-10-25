@@ -219,3 +219,27 @@ def test_a_corrupt_zip_fails_one_file(tmp_path: Path) -> None:
         now=lambda: at(date(2026, 10, 24)),
     )  # fmt: skip
     assert (r.failed, r.saved) == (1, 1)
+
+
+def test_a_damaged_daily_copy_is_replaced(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    day = date(2026, 10, 22)
+    url = cdn.daily_url("FORF", day)
+    client = FakeClient(routes={url: response(url, DAILY, headers={"ETag": '"e1"'})})
+    kw = dict(since=day, until=day, facilities=["FORF"])
+    cdn.capture_daily(client, store, now=lambda: at(day), **kw)  # type: ignore[arg-type]
+    first = store.latest(cdn.DAILY_SOURCE)["FORFshvol20261022"]
+    store.path(first.files[0]).write_bytes(b"rot")
+    later = date(2026, 12, 1)  # outside the refresh window: needs --refresh-since
+    r = cdn.capture_daily(client, store, now=lambda: at(later), **kw)  # type: ignore[arg-type]
+    assert r.skipped == 1
+    r = cdn.capture_daily(
+        client,
+        store,
+        refresh_since=day,
+        now=lambda: at(later),
+        **kw,  # type: ignore[arg-type]
+    )
+    assert r.saved == 1
+    fresh = store.latest(cdn.DAILY_SOURCE)["FORFshvol20261022"]
+    assert store.read(fresh.files[0]) == DAILY

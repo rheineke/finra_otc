@@ -143,3 +143,19 @@ def test_sweep_removes_old_leftovers_only(tmp_path: Path) -> None:
     assert store.sweep("s") == 2
     assert not old.exists() and not part.exists() and fresh.exists()
     assert store.latest("s")
+
+
+def test_sweep_removes_old_unrecorded_capture_folders(tmp_path: Path) -> None:
+    import os
+    import time
+
+    store = RawStore(tmp_path)
+    kept = store.save("s", "k", [("f", b"a", {})], now=NOW)
+    orphan = store.source_dir("s") / "k" / "20260101T000000000000Z"
+    orphan.mkdir()
+    (orphan / "f.gz").write_bytes(b"x")
+    two_days_ago = time.time() - 2 * 86400
+    os.utime(orphan, (two_days_ago, two_days_ago))
+    os.utime(store.path(kept.files[0]).parent, (two_days_ago, two_days_ago))
+    assert store.sweep("s") == 1
+    assert not orphan.exists() and store.read(kept.files[0]) == b"a"

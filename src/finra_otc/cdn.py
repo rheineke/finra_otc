@@ -46,6 +46,21 @@ def is_missing(e: HttpError) -> bool:
     return not e.body and (e.header("Content-Type") or "").startswith("application/xml")
 
 
+def _intact(store: RawStore, capture: Capture, *, full: bool) -> bool:
+    """Is the saved copy still good? ``full`` reads and hashes it; otherwise
+    (multi-GB ZIPs) only its size is checked, and the build verifies it."""
+    try:
+        if full:
+            for f in capture.files:
+                store.read(f)
+            return True
+        return all(
+            store.path(f).stat().st_size == f.stored_bytes for f in capture.files
+        )
+    except OSError:
+        return False
+
+
 def _same_file(head: HttpResponse, previous: Capture) -> bool:
     """Do HEAD's validators match the saved file? False when there are none."""
     meta = previous.files[0].meta
@@ -154,6 +169,7 @@ def capture_daily(
     until: date | None = None,
     facilities: list[str] | None = None,
     refresh_days: int = 10,
+    refresh_since: date | None = None,
     grace_days: int = 7,
     recheck_absent: bool = False,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -172,7 +188,9 @@ def capture_daily(
             key = daily_name(facility, day)
             url = daily_url(facility, day)
             previous = latest.get(key)
-            recent = day >= today - timedelta(days=refresh_days)
+            recent = day >= today - timedelta(days=refresh_days) or (
+                refresh_since is not None and day >= refresh_since
+            )
             if previous is not None and not recent:
                 result.skipped += 1
                 continue
@@ -187,7 +205,11 @@ def capture_daily(
                 continue
             result.checked += 1
             try:
-                if previous is not None and _same_file(client.head(url), previous):
+                if (
+                    previous is not None
+                    and _same_file(client.head(url), previous)
+                    and _intact(store, previous, full=True)
+                ):
                     result.unchanged += 1
                     continue
                 response = client.get(url)
@@ -209,9 +231,11 @@ def capture_daily(
                 result.failed += 1
                 result.errors.append(f"{key}: {problem}; not saved")
                 continue
-            if previous is not None and previous.sha256s == [
-                Capture.sha_of(response.content)
-            ]:
+            if (
+                previous is not None
+                and _intact(store, previous, full=True)
+                and previous.sha256s == [Capture.sha_of(response.content)]
+            ):
                 result.unchanged += 1
                 continue
             file_meta = {
@@ -241,6 +265,7 @@ def capture_monthly(
     until: date | None = None,
     facilities: list[str] | None = None,
     refresh_months: int = 2,
+    refresh_since: date | None = None,
     grace_days: int = 45,
     recheck_absent: bool = False,
     dry_run: bool = False,
@@ -260,7 +285,7 @@ def capture_monthly(
         for month in months(start, end):
             recent = month >= (
                 today.replace(day=1) - timedelta(days=31 * refresh_months)
-            )
+            ) or (refresh_since is not None and month >= refresh_since.replace(day=1))
             overdue = _month_end(month) + timedelta(days=grace_days)
             for part in [None, *range(1, MAX_PARTS + 1)]:
                 key = monthly_name(facility, month, part)
@@ -297,7 +322,11 @@ def capture_monthly(
                         continue  # the month may be split into parts
                     break
                 size = int(head.header("Content-Length") or 0)
-                if previous is not None and _same_file(head, previous):
+                if (
+                    previous is not None
+                    and _same_file(head, previous)
+                    and _intact(store, previous, full=False)
+                ):
                     result.unchanged += 1
                 elif dry_run:
                     result.bytes += size
