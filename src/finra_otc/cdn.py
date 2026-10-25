@@ -10,24 +10,50 @@ and facility. The Nasdaq Carteret TRF (FNSQ) splits a month into parts _1, _2...
 
     monthly/{facility}sh{YYYYMM}[_{part}].zip
 
-Missing files answer 403. The CDN has no index, so dates are enumerated
-(weekdays for daily files) and misses are recorded in absent.jsonl so that
-they aren't asked for again once FINRA has had time to post them.
+Missing files answer 403 with the storage bucket's XML AccessDenied error. Any
+other 403 (a bot block, say) is a failure, not a missing file. The CDN has no
+index, so dates are enumerated (weekdays for daily files) and misses are
+recorded in absent.jsonl so that they aren't asked for again once FINRA has
+had time to post them.
 """
 
+import uuid
 import zipfile
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 
+from requests import RequestException
+
 from .api import FINRA_TZ
-from .http import HttpClient, HttpError
+from .http import HttpClient, HttpError, HttpResponse
 from .raw import Capture, RawStore
 
 CDN_URL = "https://cdn.finra.org/equity/regsho"
 DAILY_SOURCE = "cdn/regsho_daily"
 MONTHLY_SOURCE = "cdn/regsho_monthly"
 MISSING = frozenset({403, 404})
+
+
+def is_missing(e: HttpError) -> bool:
+    """A missing file, as opposed to a refusal or an outage."""
+    if e.status not in MISSING:
+        return False
+    if b"<Code>AccessDenied</Code>" in e.body or b"<Code>NoSuchKey</Code>" in e.body:
+        return True
+    # A HEAD has no body; the bucket's errors are XML, a block page isn't.
+    return not e.body and (e.header("Content-Type") or "").startswith("application/xml")
+
+
+def _same_file(head: HttpResponse, previous: Capture) -> bool:
+    """Do HEAD's validators match the saved file? False when there are none."""
+    meta = previous.files[0].meta
+    etag = head.header("ETag")
+    if etag is not None:
+        return bool(etag == meta.get("etag"))
+    modified = head.header("Last-Modified")
+    return modified is not None and modified == meta.get("last_modified")
+
 
 # Facility: first date to try. CNMS (consolidated NMS) and FNQC (Nasdaq Chicago
 # TRF) begin in August 2018. FNSQ is the Nasdaq Carteret TRF, FNYX the NYSE TRF,
@@ -147,18 +173,20 @@ def capture_daily(
                 continue
             result.checked += 1
             try:
-                if previous is not None:
-                    etag = client.head(url).header("ETag")
-                    if etag is not None and etag == previous.files[0].meta.get("etag"):
-                        result.unchanged += 1
-                        continue
+                if previous is not None and _same_file(client.head(url), previous):
+                    result.unchanged += 1
+                    continue
                 response = client.get(url)
             except HttpError as e:
-                if e.status in MISSING:
+                if is_missing(e):
                     if previous is None:
                         store.record_absence(DAILY_SOURCE, key, url, e.status, now())
                     result.absent += 1
                     continue
+                result.failed += 1
+                result.errors.append(f"{key}: {e}")
+                continue
+            except RequestException as e:
                 result.failed += 1
                 result.errors.append(f"{key}: {e}")
                 continue
@@ -241,8 +269,8 @@ def capture_monthly(
                 result.checked += 1
                 try:
                     head = client.head(url)
-                except HttpError as e:
-                    if e.status not in MISSING:
+                except (HttpError, RequestException) as e:
+                    if not isinstance(e, HttpError) or not is_missing(e):
                         result.failed += 1
                         result.errors.append(f"{key}: {e}")
                         break
@@ -252,9 +280,8 @@ def capture_monthly(
                     if part is None:
                         continue  # the month may be split into parts
                     break
-                etag = head.header("ETag")
                 size = int(head.header("Content-Length") or 0)
-                if previous is not None and etag == previous.files[0].meta.get("etag"):
+                if previous is not None and _same_file(head, previous):
                     result.unchanged += 1
                 elif dry_run:
                     result.bytes += size
@@ -265,7 +292,7 @@ def capture_monthly(
                         result.saved += 1
                         result.bytes += size
                         progress(f"{key}: {size:,} bytes")
-                    except (HttpError, OSError, ValueError) as e:
+                    except (HttpError, RequestException, OSError, ValueError) as e:
                         result.failed += 1
                         result.errors.append(f"{key}: {e}")
                 if part is None:
@@ -282,7 +309,8 @@ def _download_monthly(
     url: str,
     now: Callable[[], datetime],
 ) -> Capture:
-    scratch = store.scratch_dir(MONTHLY_SOURCE) / f"{key}.zip.part"
+    # Unique, so two processes fetching the same file don't share it.
+    scratch = store.scratch_dir(MONTHLY_SOURCE) / f"{key}.{uuid.uuid4().hex}.part"
     try:
         download = client.download(url, scratch)
         with scratch.open("rb") as f:

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import requests
 from fakes import FakeClient, response
 
 from finra_otc import api
@@ -259,3 +260,55 @@ def test_capture_dataset_counts_failures_and_continues(tmp_path: Path) -> None:
     r = api.capture_dataset(client, store, WEEKLY, now=lambda: NOW)
     assert (r.saved, r.failed) == (0, 1)
     assert store.latest("api/weeklySummary") == {}
+
+
+def test_network_errors_fail_one_partition_not_the_run(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    client = catalog_client(rows(2))
+    parts = {
+        "availablePartitions": [
+            {"partitions": ["2026-09-14", "T1"]},
+            {"partitions": ["2026-09-21", "T1"]},
+        ]
+    }
+    client.routes[api.partitions_url("weeklySummary")] = response(
+        "p", json.dumps(parts).encode(), headers={"Content-Type": "application/json"}
+    )
+    inner = pager(rows(2))
+
+    def flaky(body: Mapping[str, Any] | None) -> HttpResponse:
+        assert body is not None
+        if body["compareFilters"][0]["fieldValue"] == "2026-09-14":
+            raise requests.exceptions.ChunkedEncodingError("cut short")
+        return inner(body)
+
+    client.posts[api.data_url("weeklySummary")] = flaky
+    r = api.capture_dataset(client, store, WEEKLY, now=lambda: NOW)
+    assert (r.saved, r.failed) == (1, 1)
+    assert set(store.latest("api/weeklySummary")) == {"2026-09-21_T1"}
+
+
+def test_unchanged_refetch_stops_republished_refetching(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    client = catalog_client(rows(2))
+    details = (
+        b'"lastUpdateDate","tierIdentifier","summaryTypeCode","weekStartDate"\n'
+        b'"2026-10-24","T1","ATS_W_SMBL","2026-09-14"\n'
+    )
+    store.save(
+        "api/weeklyDownloadDetails",
+        "all",
+        [("offset-0000000.csv", details, {"rows": 1})],
+        now=NOW,
+    )
+    weekly = api.Dataset(
+        "weeklySummary", "t", page_size=3, details="weeklyDownloadDetails"
+    )
+    # Captured on the day of FINRA's update: fetched again the next day...
+    api.capture_dataset(client, store, weekly, now=lambda: NOW)
+    day2 = datetime(2026, 10, 25, 16, tzinfo=UTC)
+    r = api.capture_dataset(client, store, weekly, now=lambda: day2)
+    assert (r.planned, r.unchanged) == (1, 1)
+    # ...but not every day after that.
+    day3 = datetime(2026, 10, 26, 16, tzinfo=UTC)
+    assert api.capture_dataset(client, store, weekly, now=lambda: day3).planned == 0

@@ -8,6 +8,10 @@ from typing import Any
 
 from finra_otc.http import Download, HttpError, HttpResponse
 
+MISSING_BODY = (
+    b"<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"
+)
+
 Handler = Callable[[Mapping[str, Any] | None], HttpResponse]
 
 
@@ -32,9 +36,11 @@ class FakeClient:
         self.calls.append((method, url))
         r = self.routes.get(url)
         if r is None:
-            raise HttpError(url, 403)
+            # What the CDN's bucket answers for a missing file.
+            body = b"" if method == "HEAD" else MISSING_BODY
+            raise HttpError(url, 403, body, {"Content-Type": "application/xml"})
         if r.status >= 400:
-            raise HttpError(url, r.status, r.content)
+            raise HttpError(url, r.status, r.content, r.headers)
         return r
 
     def get(self, url: str) -> HttpResponse:

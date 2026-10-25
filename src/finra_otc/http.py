@@ -15,6 +15,13 @@ USER_AGENT = "finra-otc/0.2 (+https://github.com/rheineke/finra_otc)"
 
 # Worth retrying: throttling and transient server errors.
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+# Worth retrying: dropped connections and bodies cut short.
+TRANSIENT_ERRORS = (
+    requests.ConnectionError,
+    requests.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ContentDecodingError,
+)
 
 
 @dataclass(frozen=True)
@@ -61,11 +68,25 @@ class HttpClient(Protocol):
 
 
 class HttpError(RuntimeError):
-    def __init__(self, url: str, status: int, body: bytes = b"") -> None:
+    def __init__(
+        self,
+        url: str,
+        status: int,
+        body: bytes = b"",
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
         detail = body[:300].decode("utf-8", "replace").strip()
         super().__init__(f"HTTP {status} for {url}" + (f": {detail}" if detail else ""))
         self.url = url
         self.status = status
+        self.body = body
+        self.headers = dict(headers or {})
+
+    def header(self, name: str) -> str | None:
+        for key, value in self.headers.items():
+            if key.lower() == name.lower():
+                return value
+        return None
 
 
 @dataclass
@@ -115,7 +136,7 @@ class RequestsClient:
                         if r.status_code in RETRY_STATUSES and attempt < self.retries:
                             self._backoff(attempt, r.headers.get("Retry-After"))
                             continue
-                        raise HttpError(r.url, r.status_code, r.content)
+                        raise HttpError(r.url, r.status_code, r.content, r.headers)
                     digest = hashlib.sha256()
                     size = 0
                     with dest.open("wb") as f:
@@ -124,14 +145,20 @@ class RequestsClient:
                             size += len(chunk)
                             f.write(chunk)
                     expected = r.headers.get("Content-Length")
-                    if expected is not None and int(expected) != size:
+                    # Content-Length counts encoded bytes; only check it unencoded.
+                    encoded = r.headers.get("Content-Encoding", "identity")
+                    if (
+                        expected is not None
+                        and encoded == "identity"
+                        and int(expected) != size
+                    ):
                         raise requests.ConnectionError(
                             f"{url}: got {size:,} of {int(expected):,} bytes"
                         )
                     return Download(
                         r.url, r.status_code, dict(r.headers), digest.hexdigest(), size
                     )
-            except requests.ConnectionError, requests.Timeout:
+            except TRANSIENT_ERRORS:
                 dest.unlink(missing_ok=True)
                 if attempt == self.retries:
                     raise
@@ -157,7 +184,7 @@ class RequestsClient:
                     timeout=self.timeout,
                     allow_redirects=True,
                 )
-            except requests.ConnectionError, requests.Timeout:
+            except TRANSIENT_ERRORS:
                 if attempt == self.retries:
                     raise
                 self._backoff(attempt, None)
@@ -166,7 +193,7 @@ class RequestsClient:
                 self._backoff(attempt, r.headers.get("Retry-After"))
                 continue
             if r.status_code >= 400:
-                raise HttpError(r.url, r.status_code, r.content)
+                raise HttpError(r.url, r.status_code, r.content, r.headers)
             return HttpResponse(r.url, r.status_code, dict(r.headers), r.content)
         raise AssertionError("unreachable")
 

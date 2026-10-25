@@ -40,11 +40,13 @@ CSV, about 2.5 times smaller than JSON.
 | Source | What | History | Size |
 |---|---|---|---|
 | `regsho_daily` | Daily short-sale volume files, one per trade date and facility: CNMS (consolidated NMS), FNQC (Nasdaq TRF Chicago), FNSQ (Nasdaq TRF Carteret), FNYX (NYSE TRF), FNRA (ADF) and FORF (ORF) | from 2009-08 (CNMS and FNQC from 2018-08) | about 0.5 MB a file |
-| `regsho_monthly` | Monthly short-sale transaction files: every short sale, one ZIP per month and facility. FNSQ months come in parts (`_1` to `_4`). | from 2009-08 | several GB a month today; run `--dry-run` for the total |
+| `regsho_monthly` | Monthly short-sale transaction files: every short sale, one ZIP per month and facility. FNSQ months come in parts (`_1` to `_4`). | from 2009-08 | 222 GB of ZIPs in all (1,123 files, October 2026), about 3 GB a month now; FNSQ is 197 GB of it |
 
 The API's `regShoDaily` keeps a year; the daily files go back to 2009. The CDN
 has no index, so the tool tries every weekday (and month) and records misses
-in `absent.jsonl`. A miss isn't asked for again once the file is overdue (a
+in `absent.jsonl`. A miss is a 403 carrying the storage bucket's
+`AccessDenied` error; any other refusal counts as a failure, so a bot block
+can't mark files missing. A miss isn't asked for again once the file is overdue (a
 week for daily files, 45 days after month end for monthly ones), unless you
 pass `--recheck-absent`. Recent files (the last 10 days, the last 2 months) are
 checked again by ETag, because FINRA sometimes reposts them.
@@ -70,6 +72,7 @@ that history. `capture legacy <folder>` imports them (a folder of
 data/raw/<source>/<key>/<captured_at>/<file>[.gz]   files exactly as received
 data/raw/<source>/manifest.jsonl                    one line per complete capture
 data/raw/<source>/absent.jsonl                      CDN files found missing
+data/raw/<source>/checks.jsonl                      re-fetches that found no change
 data/parquet/api/<dataset>/<partition>.parquet
 data/parquet/cdn/regsho_daily/<facility>/<YYYY-MM>.parquet
 data/parquet/cdn/regsho_monthly/<facility>sh<YYYYMM>[_<part>].parquet
@@ -82,11 +85,13 @@ and partition list, saved when they change), `cdn/regsho_daily`,
 
 Text is gzipped on disk, and ZIPs are stored as-is. Nothing is overwritten:
 when a partition or file changes, the new version is saved next to the old one,
-and the manifest says which is newest. Files are written first and the
-manifest line last, so an interrupted capture leaves nothing half-recorded.
+and the manifest says which is newest. Files are written and synced to disk
+first and the manifest line last, so an interrupted capture leaves nothing
+half-recorded. Reads check every file against the SHA-256 in the manifest.
 
 Each Parquet file is built from the newest capture of its inputs and records a
-fingerprint of them, so `build` only redoes what changed. Read a table as a
+fingerprint of them and of the build code, so `build` only redoes what
+changed. Read a table as a
 directory:
 
 ```python
@@ -95,11 +100,16 @@ import pyarrow.parquet as pq
 weekly = pq.read_table("data/parquet/api/weeklySummary")
 ```
 
-Types follow the API metadata: dates become `date32` (timestamps for
-`otcDailyList`, whose dates carry times), and numbers become `int64` for
-counts, ranks, IDs and CRD numbers, otherwise `float64` (FINRA reports
-fractional shares). Empty values become null. A value that doesn't convert
-exactly fails the build of that file rather than being changed.
+Types follow the API metadata in effect when each partition was captured:
+dates become `date32` (timestamps for `otcDailyList`, whose dates carry times),
+and numbers become `int64` for counts, ranks, IDs and CRD numbers, otherwise
+`float64` (FINRA reports fractional shares; float64 keeps about 15 significant
+digits). Empty values become null, and so does the NUL or space padding in old
+monthly files' `LinkIndicator`. Values are checked as they are converted: a
+fractional count, a date with a time of day, an infinite number or text in a
+number column fails the build of that file instead of being changed. When a
+file can't be built, its old Parquet file is removed and the error reported,
+so a table never mixes in data the raw store has since replaced.
 
 ## Usage
 
@@ -118,12 +128,17 @@ finra-otc status                          # keys, captures and MB per source
 ```
 
 Rerunning a capture is cheap: it fetches partitions not captured yet, ones
-that FINRA republished (from the `*DownloadDetails` datasets), and recent
-partitions of the daily datasets. It saves only what changed. A full first API
+that FINRA republished, and recent partitions of the daily datasets, and it
+saves only what changed. A partition counts as republished when the
+`*DownloadDetails` datasets date its last update on or after the day it was
+last fetched. Partitions with no details rows (monthly summaries before 2017,
+OTC blocks before late 2019, the oldest historic weeks) are never fetched
+again unless you ask with `--refresh-since`. A full first API
 capture is a few GB and takes hours. `weeklySummaryHistoric` is the slow part,
 at about 3 seconds a page; `--workers` (default 4) sets how many partitions
-are fetched at once. A failed partition or file is reported and skipped, and
-the command exits with status 1.
+are fetched at once. A failed partition, file or dataset (including dropped
+connections, after retries) is reported and skipped, and the command exits
+with status 1.
 
 ## Setup
 

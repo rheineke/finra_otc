@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.csv as pv
 
 from .raw import Capture, RawStore
@@ -164,8 +165,9 @@ def read_table(content: bytes, week: dt.date, category: str) -> pa.Table:
             strings_can_be_null=True,
         ),
     )
-    if len(footer) > 1 or (footer and footer[0] != table.num_rows):
-        raise ValueError(f"row-count footer {footer} != {table.num_rows} rows")
+    # Every file ends with a row count; one without was cut short.
+    if footer != [table.num_rows]:
+        raise ValueError(f"row-count footer {footer} for {table.num_rows} rows")
     table = table.rename_columns(
         [VENUE_DESCRIPTION if c in VENUE_COLUMNS else c for c in table.column_names]
     )
@@ -179,6 +181,13 @@ def read_table(content: bytes, week: dt.date, category: str) -> pa.Table:
             columns.append(pa.array([week] * n, pa.date32()))
         elif f.name == CATEGORY:
             columns.append(pa.array([category] * n, pa.string()))
+        elif f.name in table.column_names and pa.types.is_date32(f.type):
+            # Parsed as timestamps; a time of day would be lost as a date.
+            ts = table[f.name]
+            days = ts.cast(pa.date32())
+            if pc.all(pc.equal(days.cast(ts.type), ts)).as_py() is False:
+                raise ValueError(f"{f.name}: a date has a time of day")
+            columns.append(days)
         elif f.name in table.column_names:
             columns.append(table[f.name].cast(f.type))
         else:

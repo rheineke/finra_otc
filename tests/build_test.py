@@ -1,4 +1,5 @@
 import datetime as dt
+import hashlib
 import io
 import json
 import zipfile
@@ -210,7 +211,8 @@ def save_monthly(store: RawStore, key: str, text: bytes) -> None:
         z.writestr(f"{key}.txt", text)
     scratch = store.scratch_dir(cdn.MONTHLY_SOURCE) / "x"
     scratch.write_bytes(buf.getvalue())
-    store.save_download(cdn.MONTHLY_SOURCE, key, f"{key}.zip", scratch, "sha", now=NOW)
+    sha = hashlib.sha256(buf.getvalue()).hexdigest()
+    store.save_download(cdn.MONTHLY_SOURCE, key, f"{key}.zip", scratch, sha, now=NOW)
 
 
 def test_build_monthly(tmp_path: Path) -> None:
@@ -283,3 +285,75 @@ def test_legacy_parse_filename() -> None:
     assert info.key == "2014-06-23_ATS_NMS-Tier-1_20151007T000000"
     with pytest.raises(ValueError):
         legacy.parse_filename("notes")
+
+
+def test_a_damaged_raw_file_fails_its_output_and_removes_the_stale_one(
+    tmp_path: Path,
+) -> None:
+    store = RawStore(tmp_path)
+    save_catalog(store, "weeklySummary", METADATA)
+    save_partition(store, "weeklySummary", "a", [PAGE])
+    save_partition(store, "weeklySummary", "b", [PAGE])
+    build.build_api(store, ["weeklySummary"])
+    out = tmp_path / "parquet/api/weeklySummary"
+    # A newer capture of "a" whose file is then damaged on disk.
+    save_partition(
+        store, "weeklySummary", "a", [PAGE + PAGE[-30:]], now=NOW.replace(hour=17)
+    )
+    damaged = store.latest("api/weeklySummary")["a"].files[0]
+    store.path(damaged).write_bytes(b"\x1f\x8b junk")
+    [r] = build.build_api(store, ["weeklySummary"])
+    assert (r.failed, r.current) == (1, 1)
+    assert sorted(p.name for p in out.iterdir()) == ["b.parquet"]
+    assert pq.read_table(out).num_rows == 2
+
+
+def test_infinite_numbers_fail(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    save_catalog(store, "weeklySummary", METADATA)
+    page = PAGE.split(b"\n")[0] + b'\n"2026-09-14","A","7","1e400"\n'
+    save_partition(store, "weeklySummary", "k", [page])
+    [r] = build.build_api(store, ["weeklySummary"])
+    assert r.failed == 1 and "infinite" in r.errors[0]
+
+
+def test_each_capture_uses_the_metadata_of_its_time(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    save_catalog(store, "weeklySummary", METADATA)
+    save_partition(store, "weeklySummary", "old", [PAGE])
+    # Later, FINRA renames a field.
+    renamed = json.loads(json.dumps(METADATA))
+    renamed["fields"][1]["name"] = "marketParticipantID"
+    content = json.dumps(renamed).encode()
+    later = NOW.replace(hour=18)
+    store.save(
+        "api_catalog/weeklySummary",
+        "metadata",
+        [("metadata.json", content, {})],
+        now=later,
+    )
+    new_page = PAGE.replace(b'"MPID"', b'"marketParticipantID"')
+    save_partition(
+        store, "weeklySummary", "new", [new_page], now=later.replace(minute=5)
+    )
+    [r] = build.build_api(store, ["weeklySummary"])
+    assert (r.built, r.failed) == (2, 0), r.errors
+    old = pq.read_table(tmp_path / "parquet/api/weeklySummary/old.parquet")
+    assert "MPID" in old.schema.names
+
+
+def test_link_indicator_padding_is_null(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    save_monthly(store, "FNYXsh200908", MONTHLY_OLD.replace(b"| \n", b"|\x00\n"))
+    assert build.build_monthly(store).built == 1
+    t = pq.read_table(tmp_path / "parquet/cdn/regsho_monthly/FNYXsh200908.parquet")
+    assert t.column("LinkIndicator").to_pylist() == [None]
+
+
+def test_legacy_file_without_footer_fails(tmp_path: Path) -> None:
+    src = tmp_path / "old"
+    write_legacy(src, "2018-08-06_OTC_OTCE_2018-09-01 00:00:00.csv", OTC_FILE[:-2])
+    store = RawStore(tmp_path / "data")
+    legacy.import_legacy(store, src, now=lambda: NOW)
+    r = build.build_legacy(store)
+    assert r.failed == 1 and "footer" in r.errors[0]

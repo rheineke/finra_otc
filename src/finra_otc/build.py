@@ -6,16 +6,20 @@
     parquet/legacy/weekly/<YYYY>.parquet
 
 Each output is built from the newest capture of each of its inputs, and is
-rebuilt only when those inputs change: a fingerprint of them is stored in the
-file's metadata. Files are written to a temporary name and then renamed, so a
-failed build leaves the previous file. Read a table with, for example,
+rebuilt only when those inputs or the code that builds them change: a
+fingerprint of both is stored in the file's metadata. Files are written under a
+hidden temporary name (which dataset readers skip) and then renamed. When an
+output can't be built, its old file is removed, so readers never see a table
+that no longer matches the raw store. Read a table with, for example,
 ``pyarrow.parquet.read_table("data/parquet/api/weeklySummary")``.
 
-Types follow the API metadata: String to string, Date to date32 (timestamp for
-the OTC daily list, whose dates carry times), and Number to float64, or to int64 for
-counts, ranks, IDs and CRD numbers. Share quantities stay float64 because
-FINRA reports fractional shares. Every value is checked as it is converted, and
-a value that won't convert exactly fails the build instead of being altered.
+Types follow the API metadata in effect when each partition was captured:
+String to string, Date to date32 (timestamp for the OTC daily list, whose dates
+carry times), and Number to float64, or to int64 for counts, ranks, IDs and CRD
+numbers. Share quantities stay float64 because FINRA reports fractional shares.
+Values are checked as they are converted: a fractional count, a date with a
+time of day, an infinite or NaN number, or text in a number column fails the
+build of that file instead of being altered.
 """
 
 import csv
@@ -23,10 +27,12 @@ import hashlib
 import io
 import json
 import zipfile
+from bisect import bisect_right
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import date
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 
@@ -41,8 +47,10 @@ from .raw import Capture, RawStore
 # pyarrow-stubs types these functions too narrowly for string arrays.
 _pc: Any = pc
 
-# Bump to rebuild every output after a change to how tables are built.
-BUILD_VERSION = 1
+# Outputs are rebuilt when the code that builds them changes.
+CODE = hashlib.sha256(
+    Path(__file__).read_bytes() + Path(legacy.__file__).read_bytes()
+).hexdigest()
 FINGERPRINT = b"finra_otc.fingerprint"
 INPUTS = b"finra_otc.inputs"
 
@@ -52,8 +60,17 @@ TIMESTAMP_DATASETS = {"otcDailyList": frozenset({"calendarDay"})}
 INTEGER_SUFFIXES = ("Count", "Rank", "ID", "CRDNumber", "RoundLotQuantity")
 INTEGER_FIELDS = frozenset({"accountingYearMonthNumber"})
 
+# Errors that mean one output can't be built; the others still are.
+BUILD_ERRORS = (
+    pa.ArrowInvalid,
+    OSError,  # includes raw.CorruptFile
+    EOFError,
+    ValueError,  # includes UnicodeDecodeError
+    zipfile.BadZipFile,
+)
 
-class BuildError(RuntimeError):
+
+class BuildError(ValueError):
     pass
 
 
@@ -73,7 +90,7 @@ def parquet_dir(store: RawStore) -> Path:
 
 def fingerprint(inputs: Iterable[Capture], extra: Any = None) -> str:
     payload = {
-        "version": BUILD_VERSION,
+        "code": CODE,
         "inputs": [[c.source, c.key, c.captured_at, c.sha256s] for c in inputs],
         "extra": extra,
     }
@@ -99,11 +116,43 @@ def _with_metadata(schema: pa.Schema, print_: str, inputs: list[Capture]) -> pa.
     )
 
 
+def temporary(path: Path) -> Path:
+    # Dataset readers skip names starting with "." or "_".
+    return path.with_name(f".{path.name}.tmp")
+
+
 def write_table(path: Path, table: pa.Table) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    pq.write_table(table, tmp, compression="zstd")
-    tmp.replace(path)
+    tmp = temporary(path)
+    try:
+        pq.write_table(table, tmp, compression="zstd")
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def build_one(
+    result: Result,
+    path: Path,
+    print_: str,
+    label: str,
+    write: Callable[[], int],
+    progress: Callable[[str], None],
+) -> None:
+    """Build one output unless current; ``write`` writes it and returns rows."""
+    if is_current(path, print_):
+        result.current += 1
+        return
+    try:
+        rows = write()
+    except BUILD_ERRORS as e:
+        path.unlink(missing_ok=True)
+        result.failed += 1
+        result.errors.append(f"{label}: {e}")
+        return
+    result.built += 1
+    result.rows += rows
+    progress(f"{label}: {rows:,} rows")
 
 
 def header_names(first_line: bytes, delimiter: str, quoted: bool) -> list[str]:
@@ -163,7 +212,18 @@ def api_schema(dataset: str, metadata: dict[str, Any]) -> pa.Schema:
     )
 
 
-def convert(column: pa.ChunkedArray | pa.Array, to: pa.DataType, name: str) -> Any:
+def to_date(ts: Any, name: str) -> Any:
+    """Timestamps to dates, refusing any with a time of day."""
+    days = ts.cast(pa.date32())
+    # Casting a timestamp to a date silently drops the time of day.
+    if pc.all(pc.equal(days.cast(ts.type), ts)).as_py() is False:
+        raise BuildError(f"{name}: a date has a time of day")
+    return days
+
+
+def convert(
+    column: pa.ChunkedArray[Any] | pa.Array[Any], to: pa.DataType, name: str
+) -> Any:
     """Convert a string column exactly, or raise."""
     try:
         if pa.types.is_string(to):
@@ -171,16 +231,15 @@ def convert(column: pa.ChunkedArray | pa.Array, to: pa.DataType, name: str) -> A
         if pa.types.is_int64(to):
             return column.cast(pa.decimal128(38, 9)).cast(pa.int64())
         if pa.types.is_floating(to):
-            return column.cast(to)
+            values = column.cast(to)
+            # Overflow (1e400) parses as infinity; FINRA never sends NaN.
+            if pc.all(pc.is_finite(values)).as_py() is False:
+                raise BuildError(f"{name}: a number is infinite or NaN")
+            return values
         if pa.types.is_timestamp(to):
             return column.cast(to)
         if pa.types.is_date32(to):
-            ts = column.cast(pa.timestamp("ms"))
-            days = ts.cast(pa.date32())
-            # Casting a timestamp to a date silently drops the time of day.
-            if pc.all(pc.equal(days.cast(pa.timestamp("ms")), ts)).as_py() is False:
-                raise BuildError(f"{name}: a date has a time of day")
-            return days
+            return to_date(column.cast(pa.timestamp("ms")), name)
     except (pa.ArrowInvalid, pa.ArrowNotImplementedError) as e:
         raise BuildError(f"{name}: {e}") from e
     raise BuildError(f"{name}: no conversion to {to}")
@@ -216,6 +275,30 @@ def build_api_partition(
     return table
 
 
+class Schemas:
+    """The schema from the metadata in effect when each capture was made.
+
+    A capture older than every saved metadata uses the oldest one.
+    """
+
+    def __init__(self, store: RawStore, dataset: str) -> None:
+        source = f"api_catalog/{dataset}"
+        found = sorted(
+            (c for c in store.captures(source) if c.key == "metadata"),
+            key=lambda c: c.captured_at,
+        )
+        self.times = [c.captured_at for c in found]
+        self.schemas = [
+            api_schema(dataset, json.loads(store.read(c.files[0]))) for c in found
+        ]
+
+    def __bool__(self) -> bool:
+        return bool(self.schemas)
+
+    def at(self, captured_at: str) -> pa.Schema:
+        return self.schemas[max(0, bisect_right(self.times, captured_at) - 1)]
+
+
 def build_api(
     store: RawStore,
     datasets: list[str] | None = None,
@@ -226,34 +309,35 @@ def build_api(
         source = f"api/{dataset}"
         result = Result(source)
         results.append(result)
-        catalog = store.latest(f"api_catalog/{dataset}").get("metadata")
         captures = store.latest(source)
         if not captures:
             continue
-        if catalog is None:
+        try:
+            schemas = Schemas(store, dataset)
+        except BUILD_ERRORS as e:
+            result.failed += 1
+            result.errors.append(f"metadata: {e}")
+            continue
+        if not schemas:
             result.failed += 1
             result.errors.append("no metadata captured")
             continue
-        metadata = json.loads(store.read(catalog.files[0]))
-        schema = api_schema(dataset, metadata)
         for key, capture in sorted(captures.items()):
             path = parquet_dir(store) / "api" / dataset / f"{key}.parquet"
+            schema = schemas.at(capture.captured_at)
             print_ = fingerprint([capture], schema.to_string())
-            if is_current(path, print_):
-                result.current += 1
-                continue
-            try:
-                table = build_api_partition(store, capture, schema)
-            except (BuildError, pa.ArrowInvalid, UnicodeDecodeError) as e:
-                result.failed += 1
-                result.errors.append(f"{key}: {e}")
-                continue
-            metadata = _with_metadata(schema, print_, [capture]).metadata
-            write_table(path, table.replace_schema_metadata(metadata))
-            result.built += 1
-            result.rows += table.num_rows
-            progress(f"{source} {key}: {table.num_rows:,} rows")
+            write = partial(_write_api, store, capture, schema, path, print_)
+            build_one(result, path, print_, f"{source} {key}", write, progress)
     return results
+
+
+def _write_api(
+    store: RawStore, capture: Capture, schema: pa.Schema, path: Path, print_: str
+) -> int:
+    table = build_api_partition(store, capture, schema)
+    metadata = _with_metadata(schema, print_, [capture]).metadata
+    write_table(path, table.replace_schema_metadata(metadata))
+    return table.num_rows
 
 
 def _footer_handler(
@@ -267,6 +351,18 @@ def _footer_handler(
         return "error"
 
     return handle
+
+
+def _check_footer(footer: list[str], rows: int, what: str) -> None:
+    if len(footer) != 1 or int(footer[0]) != rows:
+        raise BuildError(f"{what}: row-count footer {footer} for {rows} rows")
+
+
+def _yyyymmdd(column: Any, what: str) -> Any:
+    try:
+        return _pc.strptime(column, "%Y%m%d", "s").cast(pa.date32())
+    except pa.ArrowInvalid as e:
+        raise BuildError(f"{what} Date: {e}") from e
 
 
 DAILY_FIELDS: list[pa.Field[Any]] = [
@@ -309,18 +405,6 @@ def read_daily(content: bytes, facility: str, what: str) -> pa.Table:
     return pa.Table.from_arrays(columns, schema=DAILY_SCHEMA)
 
 
-def _check_footer(footer: list[str], rows: int, what: str) -> None:
-    if len(footer) != 1 or int(footer[0]) != rows:
-        raise BuildError(f"{what}: row-count footer {footer} for {rows} rows")
-
-
-def _yyyymmdd(column: Any, what: str) -> Any:
-    try:
-        return _pc.strptime(column, "%Y%m%d", "s").cast(pa.date32())
-    except pa.ArrowInvalid as e:
-        raise BuildError(f"{what} Date: {e}") from e
-
-
 def build_daily(
     store: RawStore, progress: Callable[[str], None] = lambda _: None
 ) -> Result:
@@ -334,24 +418,20 @@ def build_daily(
             parquet_dir(store) / "cdn" / "regsho_daily" / facility / f"{month}.parquet"
         )
         print_ = fingerprint(captures)
-        if is_current(path, print_):
-            result.current += 1
-            continue
-        try:
-            tables = [
-                read_daily(store.read(c.files[0]), facility, c.key) for c in captures
-            ]
-        except (BuildError, pa.ArrowInvalid, ValueError) as e:
-            result.failed += 1
-            result.errors.append(f"{facility} {month}: {e}")
-            continue
-        schema = _with_metadata(DAILY_SCHEMA, print_, captures)
-        table = pa.concat_tables(tables).replace_schema_metadata(schema.metadata)
-        write_table(path, table)
-        result.built += 1
-        result.rows += table.num_rows
-        progress(f"regsho_daily {facility} {month}: {table.num_rows:,} rows")
+        write = partial(_write_daily, store, captures, facility, path, print_)
+        label = f"regsho_daily {facility} {month}"
+        build_one(result, path, print_, label, write, progress)
     return result
+
+
+def _write_daily(
+    store: RawStore, captures: list[Capture], facility: str, path: Path, print_: str
+) -> int:
+    tables = [read_daily(store.read(c.files[0]), facility, c.key) for c in captures]
+    schema = _with_metadata(DAILY_SCHEMA, print_, captures)
+    table = pa.concat_tables(tables).replace_schema_metadata(schema.metadata)
+    write_table(path, table)
+    return table.num_rows
 
 
 MONTHLY_FIELDS: list[pa.Field[Any]] = [
@@ -362,9 +442,15 @@ MONTHLY_FIELDS: list[pa.Field[Any]] = [
     pa.field("ShortType", pa.string()),
     pa.field("Size", pa.float64()),
     pa.field("Price", pa.float64()),
+    # Blank when there's no link; old files pad it with a NUL byte or a space.
     pa.field("LinkIndicator", pa.string()),
 ]
 MONTHLY_SCHEMA = pa.schema(MONTHLY_FIELDS)
+
+
+def _blank_to_null(column: Any) -> Any:
+    trimmed = _pc.utf8_trim(column, characters="\x00 ")
+    return _pc.if_else(_pc.equal(trimmed, ""), pa.scalar(None, pa.string()), trimmed)
 
 
 def _monthly_batches(
@@ -406,6 +492,8 @@ def _monthly_batches(
                 except pa.ArrowInvalid as e:
                     raise BuildError(f"{what} Time: {e}") from e
                 columns.append(stamped.cast(pa.time32("ms")))
+            elif f.name == "LinkIndicator":
+                columns.append(_blank_to_null(col))
             else:
                 columns.append(convert(col, f.type, f"{what} {f.name}"))
         yield pa.RecordBatch.from_arrays(columns, schema=MONTHLY_SCHEMA)
@@ -414,11 +502,12 @@ def _monthly_batches(
 def build_monthly_file(
     store: RawStore, capture: Capture, path: Path, print_: str
 ) -> int:
+    store.verify(capture.files[0])
     schema = _with_metadata(MONTHLY_SCHEMA, print_, [capture])
     footer: list[str] = []
     rows = 0
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = temporary(path)
     try:
         with zipfile.ZipFile(store.path(capture.files[0])) as z:
             members = [m for m in z.namelist() if not m.endswith("/")]
@@ -447,18 +536,8 @@ def build_monthly(
     for key, capture in sorted(store.latest(cdn.MONTHLY_SOURCE).items()):
         path = parquet_dir(store) / "cdn" / "regsho_monthly" / f"{key}.parquet"
         print_ = fingerprint([capture])
-        if is_current(path, print_):
-            result.current += 1
-            continue
-        try:
-            rows = build_monthly_file(store, capture, path, print_)
-        except (BuildError, pa.ArrowInvalid, zipfile.BadZipFile, ValueError) as e:
-            result.failed += 1
-            result.errors.append(f"{key}: {e}")
-            continue
-        result.built += 1
-        result.rows += rows
-        progress(f"regsho_monthly {key}: {rows:,} rows")
+        write = partial(build_monthly_file, store, capture, path, print_)
+        build_one(result, path, print_, f"regsho_monthly {key}", write, progress)
     return result
 
 
@@ -472,26 +551,23 @@ def build_legacy(
     for year, captures in sorted(by_year.items()):
         path = parquet_dir(store) / "legacy" / "weekly" / f"{year}.parquet"
         print_ = fingerprint(captures)
-        if is_current(path, print_):
-            result.current += 1
-            continue
-        try:
-            tables = [
-                legacy.read_table(
-                    store.read(c.files[0]),
-                    date.fromisoformat(c.meta["week"]),
-                    c.meta["category"],
-                )
-                for c in captures
-            ]
-        except (pa.ArrowInvalid, ValueError) as e:
-            result.failed += 1
-            result.errors.append(f"{year}: {e}")
-            continue
-        schema = _with_metadata(legacy.SCHEMA, print_, captures)
-        table = pa.concat_tables(tables).replace_schema_metadata(schema.metadata)
-        write_table(path, table)
-        result.built += 1
-        result.rows += table.num_rows
-        progress(f"legacy weekly {year}: {table.num_rows:,} rows")
+        write = partial(_write_legacy, store, captures, path, print_)
+        build_one(result, path, print_, f"legacy weekly {year}", write, progress)
     return result
+
+
+def _write_legacy(
+    store: RawStore, captures: list[Capture], path: Path, print_: str
+) -> int:
+    tables = [
+        legacy.read_table(
+            store.read(c.files[0]),
+            date.fromisoformat(c.meta["week"]),
+            c.meta["category"],
+        )
+        for c in captures
+    ]
+    schema = _with_metadata(legacy.SCHEMA, print_, captures)
+    table = pa.concat_tables(tables).replace_schema_metadata(schema.metadata)
+    write_table(path, table)
+    return table.num_rows

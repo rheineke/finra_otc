@@ -22,6 +22,8 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from requests import RequestException
+
 from .http import HttpClient, HttpError, HttpResponse
 from .raw import Capture, RawStore, check_name
 
@@ -248,6 +250,10 @@ def fetch_partition(
     return files, meta
 
 
+def _utc(timestamp: str) -> datetime:
+    return datetime.fromisoformat(timestamp).astimezone(UTC)
+
+
 def finra_date(timestamp: str) -> date:
     """The date in New York (FINRA's dates) of an ISO 8601 UTC timestamp."""
     return datetime.fromisoformat(timestamp).astimezone(FINRA_TZ).date()
@@ -259,8 +265,10 @@ def last_updates(
     """Look up when FINRA last updated a partition, from a details dataset.
 
     Rows match a partition on the partition fields they share with it. Where
-    none match on all of them (the weekly summary's NA and NMS tiers have no
-    details rows), rows matching on the date field alone are used.
+    none match on all of them (a tier missing from the details for some week),
+    rows matching on the date field alone are used. Partitions with no details
+    rows at all, such as monthly summaries before 2017, are never fetched again
+    unless asked for with ``refresh_since``.
     """
     rows = list(rows)
     shared = [f for f in fields if rows and f in rows[0]]
@@ -324,8 +332,14 @@ def plan(
     since: date | None = None,
     until: date | None = None,
     refresh_since: date | None = None,
+    checks: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> list[Plan]:
-    """Partitions to fetch: new, republished, recent, or asked for again."""
+    """Partitions to fetch: new, republished, recent, or asked for again.
+
+    A partition counts as republished when FINRA's last update is dated on or
+    after the day it was last fetched, whether that fetch saved a new capture
+    or found it unchanged (``checks``).
+    """
     todo = []
     refresh_from = (
         today - timedelta(days=dataset.refresh_days) if dataset.refresh_days else None
@@ -337,11 +351,16 @@ def plan(
                 continue
             if until is not None and first > until:
                 continue
-        capture = latest.get(partition_key(values))
+        key = partition_key(values)
+        capture = latest.get(key)
         if capture is None:
             todo.append(Plan(values, "new"))
             continue
-        captured = finra_date(capture.captured_at)
+        fetched = capture.captured_at
+        check = (checks or {}).get(key)
+        if check is not None:
+            fetched = max(fetched, check["checked_at"], key=_utc)
+        captured = finra_date(fetched)
         when = updated(values)
         if first is None:
             todo.append(Plan(values, "unpartitioned"))
@@ -437,6 +456,7 @@ def capture_dataset(
         since=since,
         until=until,
         refresh_since=refresh_since,
+        checks=store.checks(source),
     )
     result = Result(dataset.name, planned=len(todo))
 
@@ -444,7 +464,8 @@ def capture_dataset(
         return _fetch_with_retries(client, dataset, fields, item, retries)
 
     # Partitions are fetched in parallel and saved in order, by this thread only.
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+    pool = ThreadPoolExecutor(max_workers=max(1, workers))
+    try:
         window: deque[tuple[Plan, Future[tuple[list[_File], dict[str, Any]]]]] = deque()
         pending = iter(todo)
         done = 0
@@ -462,7 +483,7 @@ def capture_dataset(
             label = f"{dataset.name} {done}/{len(todo)} {key}"
             try:
                 files, meta = future.result()
-            except (CaptureError, HttpError, ValueError) as e:
+            except (CaptureError, HttpError, ValueError, RequestException) as e:
                 result.failed += 1
                 result.errors.append(f"{key}: {e}")
                 progress(f"{label}: FAILED {e}")
@@ -472,10 +493,14 @@ def capture_dataset(
                 Capture.sha_of(content) for _, content, _ in files
             ]:
                 result.unchanged += 1
+                store.record_check(source, key, now(), reason=item.reason)
                 progress(f"{label}: unchanged")
                 continue
             meta["reason"] = item.reason
             store.save(source, key, files, meta=meta, now=now())
             result.saved += 1
             progress(f"{label}: {meta['record_total']:,} rows")
+    finally:
+        # On an error or Ctrl-C, don't keep fetching partitions nobody will save.
+        pool.shutdown(wait=True, cancel_futures=True)
     return result

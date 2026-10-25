@@ -6,10 +6,11 @@ from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
+from requests import RequestException
 from tqdm import tqdm
 
 from . import api, build, cdn, legacy
-from .http import RequestsClient
+from .http import HttpError, RequestsClient
 from .raw import RawStore, data_dir
 
 
@@ -116,18 +117,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "capture":
         client = RequestsClient()
         if args.source in ("api", "all"):
-            names = getattr(args, "datasets", None) or list(api.BY_NAME)
-            for name in names:
-                r = api.capture_dataset(
-                    client,
-                    store,
-                    api.BY_NAME[name],
-                    since=args.since,
-                    until=args.until,
-                    refresh_since=getattr(args, "refresh_since", None),
-                    workers=getattr(args, "workers", 4),
-                    progress=progress,
-                )
+            wanted = set(getattr(args, "datasets", None) or api.BY_NAME)
+            # Always in DATASETS order, so details datasets are fresh first.
+            for name in [d.name for d in api.DATASETS if d.name in wanted]:
+                try:
+                    r = api.capture_dataset(
+                        client,
+                        store,
+                        api.BY_NAME[name],
+                        since=args.since,
+                        until=args.until,
+                        refresh_since=getattr(args, "refresh_since", None),
+                        workers=getattr(args, "workers", 4),
+                        progress=progress,
+                    )
+                except (api.CaptureError, HttpError, RequestException, ValueError) as e:
+                    # The catalog failed; carry on with the other datasets.
+                    print(f"{name}: FAILED", file=sys.stderr)
+                    failures += _report([str(e)])
+                    continue
                 print(
                     f"{name}: {r.planned} to fetch, {r.saved} saved, "
                     f"{r.unchanged} unchanged, {r.failed} failed"

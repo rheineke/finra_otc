@@ -5,6 +5,7 @@ Layout under the data directory:
     raw/<source>/<key>/<captured_at>/<file>[.gz]
     raw/<source>/manifest.jsonl     # one line per complete capture of a key
     raw/<source>/absent.jsonl       # keys checked and found missing (CDN only)
+    raw/<source>/checks.jsonl       # keys fetched again and found unchanged
 
 A source is a dataset, for example ``api/weeklySummary`` or
 ``cdn/regsho_daily``. A key is one unit of capture within it: an API partition
@@ -13,8 +14,9 @@ of an API query.
 
 Text is gzip-compressed on disk; gunzipping returns the bytes exactly as
 received. Files that are already compressed (ZIPs) are stored as-is. Files are
-written first and the manifest line last, so a capture missing from the
-manifest is incomplete and is ignored. Nothing is ever overwritten.
+written and synced to disk first and the manifest line last, so a capture
+missing from the manifest is incomplete and is ignored. Reads check each file
+against the SHA-256 in the manifest. Nothing is ever overwritten.
 """
 
 import gzip
@@ -23,6 +25,8 @@ import json
 import os
 import re
 import shutil
+import warnings
+import zlib
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -71,12 +75,6 @@ class Capture:
     def sha_of(content: bytes) -> str:
         return hashlib.sha256(content).hexdigest()
 
-    @staticmethod
-    def from_json(line: str) -> Capture:
-        d = json.loads(line)
-        d["files"] = [StoredFile(**f) for f in d["files"]]
-        return Capture(**d)
-
 
 @dataclass(frozen=True)
 class Absence:
@@ -85,6 +83,10 @@ class Absence:
     checked_at: str
     url: str
     status: int
+
+
+class CorruptFile(OSError):
+    """A raw file doesn't match its manifest entry."""
 
 
 def _stamp(now: datetime) -> str:
@@ -110,35 +112,57 @@ class RawStore:
     def absent_path(self, source: str) -> Path:
         return self.source_dir(source) / "absent.jsonl"
 
-    def captures(self, source: str) -> Iterator[Capture]:
-        """Every complete capture of a source, oldest first."""
-        path = self.manifest_path(source)
+    def checks_path(self, source: str) -> Path:
+        return self.source_dir(source) / "checks.jsonl"
+
+    @staticmethod
+    def _records(path: Path) -> Iterator[dict[str, Any]]:
         if not path.exists():
             return
         with path.open() as f:
-            for line in f:
-                # A crash while appending can leave a partial last line.
-                if line.endswith("\n") and line.strip():
-                    yield Capture.from_json(line)
+            for number, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    # A crash while appending leaves a partial line.
+                    warnings.warn(
+                        f"{path}:{number}: skipping a damaged line", stacklevel=2
+                    )
+
+    def captures(self, source: str) -> Iterator[Capture]:
+        """Every complete capture of a source, in the order recorded."""
+        for record in self._records(self.manifest_path(source)):
+            record["files"] = [StoredFile(**f) for f in record["files"]]
+            yield Capture(**record)
 
     def latest(self, source: str) -> dict[str, Capture]:
-        """The newest complete capture of each key."""
+        """The newest complete capture of each key, by capture time."""
         latest: dict[str, Capture] = {}
         for capture in self.captures(source):
-            latest[capture.key] = capture
+            previous = latest.get(capture.key)
+            if previous is None or capture.captured_at >= previous.captured_at:
+                latest[capture.key] = capture
         return latest
 
     def absences(self, source: str) -> dict[str, Absence]:
-        path = self.absent_path(source)
         found: dict[str, Absence] = {}
-        if not path.exists():
-            return found
-        with path.open() as f:
-            for line in f:
-                if line.endswith("\n") and line.strip():
-                    a = Absence(**json.loads(line))
-                    found[a.key] = a
+        for record in self._records(self.absent_path(source)):
+            a = Absence(**record)
+            found[a.key] = a
         return found
+
+    def checks(self, source: str) -> dict[str, dict[str, Any]]:
+        """The newest unchanged re-fetch of each key."""
+        found: dict[str, dict[str, Any]] = {}
+        for record in self._records(self.checks_path(source)):
+            found[record["key"]] = record
+        return found
+
+    def record_check(self, source: str, key: str, now: datetime, **fields: Any) -> None:
+        record = {"key": check_name(key), "checked_at": now.isoformat(), **fields}
+        self._append(self.checks_path(source), record)
 
     def record_absence(
         self, source: str, key: str, url: str, status: int, now: datetime
@@ -158,14 +182,25 @@ class RawStore:
         return self.raw_dir / stored.path
 
     def read(self, stored: StoredFile) -> bytes:
-        """The bytes exactly as received."""
-        data = self.path(stored).read_bytes()
-        return gzip.decompress(data) if stored.path.endswith(".gz") else data
+        """The bytes exactly as received, checked against the manifest."""
+        try:
+            data = self.path(stored).read_bytes()
+            if stored.path.endswith(".gz"):
+                data = gzip.decompress(data)
+        except (EOFError, zlib.error, gzip.BadGzipFile) as e:
+            raise CorruptFile(f"{stored.path}: {e}") from e
+        if hashlib.sha256(data).hexdigest() != stored.sha256:
+            raise CorruptFile(f"{stored.path}: SHA-256 doesn't match the manifest")
+        return data
 
-    def open(self, stored: StoredFile) -> Any:
-        """A binary file object over the bytes exactly as received."""
-        path = self.path(stored)
-        return gzip.open(path, "rb") if stored.path.endswith(".gz") else path.open("rb")
+    def verify(self, stored: StoredFile) -> None:
+        """Check a file stored as-is against the manifest, without loading it."""
+        digest = hashlib.sha256()
+        with self.path(stored).open("rb") as f:
+            while chunk := f.read(1 << 24):
+                digest.update(chunk)
+        if digest.hexdigest() != stored.sha256:
+            raise CorruptFile(f"{stored.path}: SHA-256 doesn't match the manifest")
 
     def capture_dir(self, source: str, key: str, now: datetime) -> Path:
         return self.source_dir(source) / check_name(key) / _stamp(now)
@@ -192,7 +227,7 @@ class RawStore:
         for name, content, file_meta in files:
             stored_name = check_name(name) + (".gz" if compress else "")
             payload = gzip.compress(content, mtime=0) if compress else content
-            (tmp / stored_name).write_bytes(payload)
+            _write_synced(tmp / stored_name, payload)
             stored.append(
                 StoredFile(
                     name=name,
@@ -226,6 +261,8 @@ class RawStore:
         shutil.rmtree(tmp, ignore_errors=True)
         tmp.mkdir(parents=True)
         size = downloaded.stat().st_size
+        with downloaded.open("rb+") as f:
+            os.fsync(f.fileno())
         downloaded.replace(tmp / check_name(name))
         stored = [
             StoredFile(
@@ -255,7 +292,9 @@ class RawStore:
         meta: Mapping[str, Any] | None,
         now: datetime,
     ) -> Capture:
+        _sync_dir(tmp)
         tmp.rename(folder)
+        _sync_dir(folder.parent)
         capture = Capture(
             source=source,
             key=key,
@@ -270,8 +309,29 @@ class RawStore:
     def _append(path: Path, record: Mapping[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(record, sort_keys=True) + "\n"
-        # One write call per line, so concurrent appenders don't interleave.
-        with path.open("a") as f:
-            f.write(line)
+        with path.open("ab") as f:
+            # End a line left partial by a crash, so this one stays readable.
+            if f.tell() > 0:
+                with path.open("rb") as r:
+                    r.seek(-1, os.SEEK_END)
+                    if r.read(1) != b"\n":
+                        line = "\n" + line
+            # One write call per line, so concurrent appenders don't interleave.
+            f.write(line.encode())
             f.flush()
             os.fsync(f.fileno())
+
+
+def _write_synced(path: Path, payload: bytes) -> None:
+    with path.open("wb") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _sync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)

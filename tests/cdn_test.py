@@ -146,3 +146,40 @@ def test_capture_monthly_rejects_non_zip(tmp_path: Path) -> None:
         now=lambda: at(date(2026, 10, 24)),
     )
     assert r.failed == 1 and store.latest(cdn.MONTHLY_SOURCE) == {}
+
+
+def test_a_block_page_is_a_failure_not_a_missing_file(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    day = date(2026, 10, 22)
+    url = cdn.daily_url("FORF", day)
+    block = response(url, b"<html>Attention Required</html>", status=403,
+                     headers={"Content-Type": "text/html"})  # fmt: skip
+    client = FakeClient(routes={url: block})
+    r = cdn.capture_daily(
+        client, store, since=day, until=day, facilities=["FORF"], now=lambda: at(day)
+    )
+    assert (r.failed, r.absent) == (1, 0)
+    assert store.absences(cdn.DAILY_SOURCE) == {}
+
+
+def test_recent_monthly_without_etag_uses_last_modified(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    month = date(2026, 9, 1)
+    url = cdn.monthly_url("FNYX", month, None)
+    headers = {"Last-Modified": "Thu, 08 Oct 2026 22:34:32 GMT"}
+    client = FakeClient(
+        routes={url: response(url, zipped("x.txt", b"d"), headers=headers)}
+    )
+    days = iter(range(20, 30))
+
+    def run() -> cdn.Result:
+        day = date(2026, 10, next(days))
+        return cdn.capture_monthly(
+            client, store, since=month, facilities=["FNYX"], now=lambda: at(day)
+        )
+
+    assert run().saved == 1
+    assert run().unchanged == 1
+    headers = {"Last-Modified": "Fri, 09 Oct 2026 10:00:00 GMT"}
+    client.routes[url] = response(url, zipped("x.txt", b"e"), headers=headers)
+    assert run().saved == 1

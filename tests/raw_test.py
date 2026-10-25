@@ -1,9 +1,11 @@
+import gzip
+import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from finra_otc.raw import RawStore, check_name
+from finra_otc.raw import CorruptFile, RawStore, check_name
 
 NOW = datetime(2026, 10, 24, 12, 0, 0, 123456, tzinfo=UTC)
 
@@ -53,7 +55,8 @@ def test_partial_manifest_line_is_ignored(tmp_path: Path) -> None:
     store.save("s", "k", [("f", b"a", {})], now=NOW)
     with store.manifest_path("s").open("a") as f:
         f.write('{"source": "s", "key": "k2"')  # crash mid-append
-    assert list(store.latest("s")) == ["k"]
+    with pytest.warns(UserWarning):
+        assert list(store.latest("s")) == ["k"]
 
 
 def test_capture_without_manifest_line_is_invisible(tmp_path: Path) -> None:
@@ -72,10 +75,48 @@ def test_save_download_moves_file(tmp_path: Path) -> None:
     store = RawStore(tmp_path)
     scratch = store.scratch_dir("s") / "f.part"
     scratch.write_bytes(b"PKdata")
-    capture = store.save_download("s", "k", "f.zip", scratch, "abc", now=NOW)
+    sha = hashlib.sha256(b"PKdata").hexdigest()
+    capture = store.save_download("s", "k", "f.zip", scratch, sha, now=NOW)
     assert not scratch.exists()
     assert store.read(capture.files[0]) == b"PKdata"
-    assert capture.files[0].sha256 == "abc"
+    store.verify(capture.files[0])
+
+
+def test_damaged_files_are_detected(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    capture = store.save("s", "k", [("a", b"x" * 1000, {})], now=NOW)
+    path = store.path(capture.files[0])
+    path.write_bytes(path.read_bytes()[:20])  # truncated gzip
+    with pytest.raises(CorruptFile):
+        store.read(capture.files[0])
+    path.write_bytes(gzip.compress(b"y" * 1000))  # wrong content
+    with pytest.raises(CorruptFile):
+        store.read(capture.files[0])
+
+
+def test_append_after_a_partial_line_keeps_the_manifest_readable(
+    tmp_path: Path,
+) -> None:
+    store = RawStore(tmp_path)
+    store.save("s", "k1", [("f", b"a", {})], now=NOW)
+    with store.manifest_path("s").open("a") as f:
+        f.write('{"source": "s", "key": "broken"')  # crash mid-append
+    store.save("s", "k2", [("f", b"b", {})], now=NOW.replace(second=1))
+    with pytest.warns(UserWarning, match="damaged line"):
+        assert set(store.latest("s")) == {"k1", "k2"}
+
+
+def test_latest_is_by_capture_time_not_manifest_order(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    newer = store.save("s", "k", [("f", b"new", {})], now=NOW.replace(second=5))
+    store.save("s", "k", [("f", b"old", {})], now=NOW)  # a slower process
+    assert store.latest("s")["k"] == newer
+
+
+def test_checks(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    store.record_check("s", "k", NOW, reason="recent")
+    assert store.checks("s")["k"]["checked_at"] == NOW.isoformat()
 
 
 def test_absences(tmp_path: Path) -> None:
