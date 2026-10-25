@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["ipdb", "mypy", "ruff"]
+dev = ["codespell", "ipdb", "mypy", "pyarrow-stubs", "ruff", "types-requests", "types-tqdm"]
 test = ["pytest"]
 
 [build-system]
@@ -31,8 +31,12 @@ extend-exclude = ["*.ipynb"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
+[tool.codespell]
+skip = "./.venv,./.git,./data,*.ipynb"
+
 [tool.mypy]
 ignore_missing_imports = true
+exclude = ["^\\.venv/"]
 
 [tool.pytest.ini_options]
 python_files = ["*_test.py"]

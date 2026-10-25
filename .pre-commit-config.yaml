@@ -21,4 +21,11 @@ repos:
     hooks:
       - id: mypy
         additional_dependencies:
+          - pyarrow-stubs
           - types-requests
+          - types-tqdm
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.3
+    hooks:
+      - id: codespell

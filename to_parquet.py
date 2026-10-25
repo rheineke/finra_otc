@@ -7,6 +7,7 @@ old one. Only the newest file for each (week, category, report type) is kept.
 import argparse
 import datetime as dt
 from pathlib import Path
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.csv as pv
@@ -22,21 +23,20 @@ VENUE_DESCRIPTION = "Venue_Description"
 # ATS files name the venue ATS_Description; OTC files, OTC_Non-ATS_Description.
 VENUE_COLUMNS = ["ATS_Description", "OTC_Non-ATS_Description"]
 
-SCHEMA = pa.schema(
-    [
-        pa.field(WEEK, pa.date32(), nullable=False),
-        pa.field(CATEGORY, pa.string(), nullable=False),
-        pa.field(REPORT_TYPE, pa.string()),
-        pa.field(SYMBOL, pa.string()),
-        pa.field(VENUE_DESCRIPTION, pa.string()),
-        pa.field("Issue_Description", pa.string()),
-        pa.field("ATS_MPID", pa.string()),  # ATS files only
-        pa.field("Shares", pa.int64()),
-        pa.field("Shares_Last_Updated", pa.date32()),
-        pa.field("Trades", pa.int64()),
-        pa.field("Trades_Last_Updated", pa.date32()),
-    ]
-)
+FIELDS: list[pa.Field[Any]] = [
+    pa.field(WEEK, pa.date32(), nullable=False),
+    pa.field(CATEGORY, pa.string(), nullable=False),
+    pa.field(REPORT_TYPE, pa.string()),
+    pa.field(SYMBOL, pa.string()),
+    pa.field(VENUE_DESCRIPTION, pa.string()),
+    pa.field("Issue_Description", pa.string()),
+    pa.field("ATS_MPID", pa.string()),  # ATS files only
+    pa.field("Shares", pa.int64()),
+    pa.field("Shares_Last_Updated", pa.date32()),
+    pa.field("Trades", pa.int64()),
+    pa.field("Trades_Last_Updated", pa.date32()),
+]
+SCHEMA = pa.schema(FIELDS)
 
 # Older files write dates as 28-JUL-14.
 DATE_FORMATS = [pv.ISO8601, "%d-%b-%y"]
