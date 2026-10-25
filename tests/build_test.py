@@ -43,7 +43,8 @@ def save_partition(
         rows = page.count(b"\n") - 1
         files.append((f"offset-{i:07d}.csv", page, {"rows": rows}))
         total += rows
-    store.save(f"api/{dataset}", key, files, meta={"record_total": total}, now=now)
+    meta = {"record_total": total, "partition": {"weekStartDate": "2026-09-14"}}
+    store.save(f"api/{dataset}", key, files, meta=meta, now=now)
 
 
 PAGE = (
@@ -397,7 +398,8 @@ def test_line_breaks_in_quoted_values_survive_big_pages(tmp_path: Path) -> None:
     header = PAGE.split(b"\n")[0] + b"\n"
     body = b'"2026-09-14","two\nlines","1","2"\n' * 30_000  # over pyarrow's 1 MB block
     files = [("offset-0000000.csv", header + body, {"rows": 30_000})]
-    store.save("api/weeklySummary", "k", files, meta={"record_total": 30_000}, now=NOW)
+    meta = {"record_total": 30_000, "partition": {"weekStartDate": "2026-09-14"}}
+    store.save("api/weeklySummary", "k", files, meta=meta, now=NOW)
     [r] = build.build_api(store, ["weeklySummary"])
     assert (r.built, r.rows) == (1, 30_000), r.errors
 
@@ -426,3 +428,30 @@ def test_force_rebuilds_current_outputs(tmp_path: Path) -> None:
     build.build_api(store, ["weeklySummary"])
     assert build.build_api(store, ["weeklySummary"])[0].current == 1
     assert build.build_api(store, ["weeklySummary"], force=True)[0].built == 1
+
+
+def test_captures_from_an_old_partitioning_are_left_out(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    save_catalog(store, "weeklySummary", METADATA)
+    save_partition(store, "weeklySummary", "2026-09-14", [PAGE])
+    # Captured whole, back when the metadata listed no partition fields.
+    files = [("offset-0000000.csv", PAGE, {"rows": 2})]
+    meta = {"record_total": 2, "partition": {}}
+    store.save("api/weeklySummary", "all", files, meta=meta, now=NOW)
+    [r] = build.build_api(store, ["weeklySummary"])
+    assert (r.built, r.failed) == (1, 0)
+    assert "left out" in r.warnings[0]
+    assert pq.read_table(tmp_path / "parquet/api/weeklySummary").num_rows == 2
+
+
+def test_partition_field_order_in_the_manifest_doesnt_matter(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    two = json.loads(json.dumps(METADATA))
+    two["partitionFields"] = ["weekStartDate", "MPID"]  # not alphabetical
+    save_catalog(store, "weeklySummary", two)
+    files = [("offset-0000000.csv", PAGE, {"rows": 2})]
+    # The manifest is written with sorted keys, so this order comes back.
+    meta = {"record_total": 2, "partition": {"MPID": "A", "weekStartDate": "x"}}
+    store.save("api/weeklySummary", "k", files, meta=meta, now=NOW)
+    [r] = build.build_api(store, ["weeklySummary"])
+    assert (r.built, r.warnings) == (1, [])

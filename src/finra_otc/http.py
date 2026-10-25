@@ -15,6 +15,8 @@ USER_AGENT = "finra-otc/0.2 (+https://github.com/rheineke/finra_otc)"
 
 # Worth retrying: throttling and transient server errors.
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+# Longest wait between retries, whatever Retry-After asks for.
+MAX_BACKOFF = 300.0
 # Worth retrying: dropped connections and bodies cut short.
 TRANSIENT_ERRORS = (
     requests.ConnectionError,
@@ -204,7 +206,7 @@ class RequestsClient:
                 delay = max(delay, float(retry_after))
             except ValueError:
                 pass
-        self.sleep(delay)
+        self.sleep(min(delay, MAX_BACKOFF))
 
     def _wait(self) -> None:
         # Threads share the client, so requests are spaced out across all of them.

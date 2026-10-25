@@ -159,3 +159,21 @@ def test_sweep_removes_old_unrecorded_capture_folders(tmp_path: Path) -> None:
     os.utime(store.path(kept.files[0]).parent, (two_days_ago, two_days_ago))
     assert store.sweep("s") == 1
     assert not orphan.exists() and store.read(kept.files[0]) == b"a"
+    # Moved aside, not deleted.
+    assert (store.source_dir("s") / ".orphans" / "k" / orphan.name / "f.gz").exists()
+
+
+def test_sweep_moves_nothing_when_the_manifest_is_damaged(tmp_path: Path) -> None:
+    import os
+    import time
+
+    store = RawStore(tmp_path)
+    kept = store.save("s", "k", [("f", b"a", {})], now=NOW)
+    old = time.time() - 2 * 86400
+    os.utime(store.path(kept.files[0]).parent, (old, old))
+    manifest = store.manifest_path("s")
+    manifest.write_text("{damaged\n" + manifest.read_text())
+    assert store.sweep("s") == 0
+    manifest.unlink()
+    assert store.sweep("s") == 0
+    assert store.path(kept.files[0]).exists()

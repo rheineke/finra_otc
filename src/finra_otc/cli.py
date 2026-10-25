@@ -50,6 +50,11 @@ def get_parser() -> argparse.ArgumentParser:
         "--workers", type=int, default=4, help="partitions fetched at once (4)"
     )
     a.add_argument(
+        "--accept-empty",
+        action="store_true",
+        help="save empty answers for partitions that used to have rows",
+    )
+    a.add_argument(
         "--refresh-since",
         type=_date,
         help="fetch again partitions dated on or after this (kept if changed)",
@@ -150,6 +155,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         until=args.until,
                         refresh_since=getattr(args, "refresh_since", None),
                         workers=getattr(args, "workers", 4),
+                        accept_empty=getattr(args, "accept_empty", False),
                         progress=progress,
                     )
                 except (
@@ -221,6 +227,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"{b.current} up to date, {b.failed} failed"
                 )
             failures += _report(b.errors)
+            for w in b.warnings:
+                print(f"  warning: {b.source}: {w}", file=sys.stderr)
     elif args.command == "status":
         status(store)
     return 1 if failures else 0

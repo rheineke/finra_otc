@@ -281,34 +281,61 @@ class RawStore:
         return self._commit(source, key, tmp, folder, stored, meta, now)
 
     def sweep(self, source: str, older_than: timedelta = timedelta(days=1)) -> int:
-        """Remove leftovers of interrupted captures; return how many.
+        """Clear leftovers of interrupted captures; return how many.
 
-        These are unfinished capture folders (*.partial), downloads
-        (.scratch/*), and finished capture folders that no manifest line names
-        (a crash between the rename and the manifest append). Only those older
-        than ``older_than`` go, so a capture running alongside keeps its own.
+        Unfinished capture folders (*.partial) and downloads (.scratch/*) are
+        deleted. Finished capture folders that no manifest line names (a crash
+        between the rename and the manifest append) are moved to .orphans/,
+        never deleted: the manifest itself may be the damaged part. Nothing is
+        moved while the manifest is missing or has damaged lines. Only items
+        older than ``older_than`` are touched, so a capture running alongside
+        keeps its own.
         """
         root = self.source_dir(source)
         if not root.exists():
             return 0
         cutoff = time.time() - older_than.total_seconds()
+        cleared = 0
+        for p in [*root.glob(".scratch/*"), *root.glob("*/*.partial")]:
+            if _older(p, cutoff):
+                _remove(p)
+                cleared += 1
+        if not self._manifest_intact(source):
+            return cleared
         recorded = {
-            (self.raw_dir / f.path).parent
+            self.capture_dir(source, c.key, datetime.fromisoformat(c.captured_at))
             for c in self.captures(source)
-            for f in c.files
         }
-        candidates = list(root.glob(".scratch/*"))
         for folder in root.glob("*/*"):
-            if folder.is_dir() and folder.parent.name != ".scratch":
-                if folder.name.endswith(".partial") or folder not in recorded:
-                    candidates.append(folder)
-        stale = [p for p in candidates if p.stat().st_mtime < cutoff]
-        for p in stale:
-            if p.is_dir():
-                shutil.rmtree(p, ignore_errors=True)
-            else:
-                p.unlink(missing_ok=True)
-        return len(stale)
+            if (
+                folder.parent.name.startswith(".")
+                or folder.name.endswith(".partial")
+                or folder in recorded
+                or not folder.is_dir()
+                or not _older(folder, cutoff)
+            ):
+                continue
+            dest = root / ".orphans" / folder.parent.name / folder.name
+            _make_dirs(dest.parent)
+            try:
+                folder.rename(dest)
+                cleared += 1
+            except FileNotFoundError:
+                pass  # committed or moved by another process meanwhile
+        return cleared
+
+    def _manifest_intact(self, source: str) -> bool:
+        path = self.manifest_path(source)
+        if not path.exists():
+            return False
+        with path.open() as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        json.loads(line)
+                    except json.JSONDecodeError:
+                        return False
+        return True
 
     def scratch_dir(self, source: str) -> Path:
         """Where in-progress downloads go, on the same filesystem as the store."""
@@ -356,6 +383,20 @@ class RawStore:
             _fsync(f.fileno())
         if new:
             _sync_dir(path.parent)
+
+
+def _older(path: Path, cutoff: float) -> bool:
+    try:
+        return path.stat().st_mtime < cutoff
+    except FileNotFoundError:
+        return False  # gone meanwhile (another process finished it)
+
+
+def _remove(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        path.unlink(missing_ok=True)
 
 
 def _fsync(fd: int) -> None:

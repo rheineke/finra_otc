@@ -243,3 +243,52 @@ def test_a_damaged_daily_copy_is_replaced(tmp_path: Path) -> None:
     assert r.saved == 1
     fresh = store.latest(cdn.DAILY_SOURCE)["FORFshvol20261022"]
     assert store.read(fresh.files[0]) == DAILY
+
+
+def test_a_missing_file_on_a_trading_day_fails(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    day = date(2026, 10, 21)
+    r = cdn.capture_daily(
+        FakeClient(),
+        store,
+        since=day,
+        until=day,
+        facilities=["CNMS"],
+        trading={day},
+        now=lambda: at(date(2026, 10, 23)),
+    )
+    assert (r.absent, r.failed) == (1, 1) and "trading day" in r.errors[0]
+
+
+def test_trading_days_come_from_the_regshodaily_catalog(tmp_path: Path) -> None:
+    import json
+
+    store = RawStore(tmp_path)
+    answer = {"availablePartitions": [{"partitions": ["2026-10-21"]}]}
+    content = json.dumps(answer).encode()
+    store.save("api_catalog/regShoDaily", "partitions", [("p.json", content, {})])
+    assert cdn.trading_days(store) == {date(2026, 10, 21)}
+
+
+def test_refresh_since_fully_verifies_monthly_zips(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    month = date(2026, 9, 1)
+    url = cdn.monthly_url("FNYX", month, None)
+    content = zipped("x.txt", b"data" * 100)
+    client = FakeClient(routes={url: response(url, content, headers={"ETag": '"e"'})})
+    days = iter(range(20, 30))
+
+    def run(**kw: object) -> cdn.Result:
+        day = date(2026, 10, next(days))
+        return cdn.capture_monthly(
+            client, store, since=month, facilities=["FNYX"],
+            now=lambda: at(day), **kw,  # type: ignore[arg-type]
+        )  # fmt: skip
+
+    assert run().saved == 1
+    saved = store.latest(cdn.MONTHLY_SOURCE)["FNYXsh202609"].files[0]
+    data = bytearray(store.path(saved).read_bytes())
+    data[-30] ^= 0xFF  # a bit flip: same size
+    store.path(saved).write_bytes(bytes(data))
+    assert run().unchanged == 1  # a size check can't see it
+    assert run(refresh_since=month).saved == 1

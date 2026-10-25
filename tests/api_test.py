@@ -347,6 +347,10 @@ def test_catalog_ignores_request_ids(tmp_path: Path) -> None:
     client = catalog_client(rows(1))
     url = api.partitions_url("weeklySummary")
     js = {"Content-Type": "application/json"}
+    # An unpartitioned dataset, like the details datasets.
+    meta_url = api.metadata_url("weeklySummary")
+    meta = {"fields": [{"name": "MPID", "type": "String"}]}
+    client.routes[meta_url] = response(meta_url, json.dumps(meta).encode(), headers=js)
     for request_id in ("a1", "b2"):
         body = {"message": "No partitions found", "requestId": request_id}
         client.routes[url] = response(url, json.dumps(body).encode(), headers=js)
@@ -397,3 +401,41 @@ def test_values_over_csvs_default_field_limit() -> None:
     page = f'"a"\n"{big}"\n'.encode()
     assert api.parse_page(page) == (["a"], 1)
     assert api.csv_rows(page) == [{"a": big}]
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"message": "No partitions found for specified dataset.", "requestId": "x"},
+        {"availablePartitions": None},
+        {"availablePartitions": [{"nope": 1}]},
+        [],
+    ],
+)
+def test_bad_partitions_answers_fail_and_save_nothing(
+    tmp_path: Path, answer: Any
+) -> None:
+    store = RawStore(tmp_path)
+    client = catalog_client(rows(1))
+    url = api.partitions_url("weeklySummary")
+    js = {"Content-Type": "application/json"}
+    client.routes[url] = response(url, json.dumps(answer).encode(), headers=js)
+    with pytest.raises(api.CaptureError):
+        api.capture_catalog(client, store, "weeklySummary", NOW)
+    assert store.latest("api_catalog/weeklySummary") == {}
+
+
+def test_accept_empty(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    client = catalog_client(rows(2))
+    api.capture_dataset(client, store, WEEKLY, now=lambda: NOW)
+    client.posts[api.data_url("weeklySummary")] = pager([])
+    r = api.capture_dataset(
+        client,
+        store,
+        WEEKLY,
+        refresh_since=date(2026, 1, 1),
+        accept_empty=True,
+        now=lambda: NOW.replace(hour=17),
+    )
+    assert r.saved == 1

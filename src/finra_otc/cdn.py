@@ -17,6 +17,7 @@ recorded in absent.jsonl so that they aren't asked for again once FINRA has
 had time to post them.
 """
 
+import json
 import uuid
 import zipfile
 import zlib
@@ -106,6 +107,21 @@ class Result:
     errors: list[str] = field(default_factory=list)
 
 
+def trading_days(store: RawStore) -> set[date]:
+    """Trade dates the API's regShoDaily lists (about a year), if captured."""
+    capture = store.latest("api_catalog/regShoDaily").get("partitions")
+    if capture is None:
+        return set()
+    try:
+        answer = json.loads(store.read(capture.files[0]))
+        return {
+            date.fromisoformat(p["partitions"][0])
+            for p in answer.get("availablePartitions") or []
+        }
+    except OSError, ValueError, KeyError, TypeError, IndexError:
+        return set()
+
+
 def daily_problem(content: bytes) -> str | None:
     """Why a daily file is unusable (wrong kind, cut short), or None."""
     if not content.startswith(DAILY_HEADER):
@@ -172,10 +188,19 @@ def capture_daily(
     refresh_since: date | None = None,
     grace_days: int = 7,
     recheck_absent: bool = False,
+    trading: set[date] | None = None,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     progress: Callable[[str], None] = lambda _: None,
 ) -> Result:
-    """Fetch daily files not yet captured; re-check recent ones for updates."""
+    """Fetch daily files not yet captured; re-check recent ones for updates.
+
+    ``trading`` holds days known to be trading days (default: the dates the
+    API's regShoDaily lists). A file missing for one of those, before today,
+    is a failure as well as an absence, so a CDN that stops serving files
+    can't go unnoticed.
+    """
+    if trading is None:
+        trading = trading_days(store)
     today = now().astimezone(FINRA_TZ).date()
     end = min(until or today, today)
     store.sweep(DAILY_SOURCE)
@@ -218,6 +243,11 @@ def capture_daily(
                     if previous is None:
                         store.record_absence(DAILY_SOURCE, key, url, e.status, now())
                     result.absent += 1
+                    if day in trading and day < today:
+                        result.failed += 1
+                        result.errors.append(
+                            f"{key}: missing, but {day} was a trading day"
+                        )
                     continue
                 result.failed += 1
                 result.errors.append(f"{key}: {e}")
@@ -322,10 +352,13 @@ def capture_monthly(
                         continue  # the month may be split into parts
                     break
                 size = int(head.header("Content-Length") or 0)
+                asked = refresh_since is not None and month >= refresh_since.replace(
+                    day=1
+                )
                 if (
                     previous is not None
                     and _same_file(head, previous)
-                    and _intact(store, previous, full=False)
+                    and _intact(store, previous, full=asked)
                 ):
                     result.unchanged += 1
                 elif dry_run:

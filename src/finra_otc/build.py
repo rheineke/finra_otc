@@ -88,6 +88,8 @@ class Result:
     rows: int = 0
     failed: int = 0
     errors: list[str] = field(default_factory=list)
+    # Shown even with --quiet, but don't fail the build.
+    warnings: list[str] = field(default_factory=list)
 
 
 def parquet_dir(store: RawStore) -> Path:
@@ -285,14 +287,17 @@ def build_api_partition(
     return table
 
 
-def dataset_schema(store: RawStore, dataset: str) -> tuple[pa.Schema, list[str]]:
+def dataset_schema(
+    store: RawStore, dataset: str
+) -> tuple[pa.Schema, list[str], list[str]]:
     """One schema for every file of a dataset: each field FINRA has ever listed.
 
     Each partition's file gets the same columns, null where its capture lacks
     them, so reading the dataset as a directory loses nothing. A field whose
     type changed between metadata versions fails the dataset. Returns the
-    schema and warnings about versions that couldn't be read (a damaged file
-    with no intact copy, or an answer without fields); those are skipped.
+    schema, the newest readable version's partition fields, and warnings about
+    versions that couldn't be read (a damaged file with no intact copy, or an
+    answer without fields); those are skipped.
     """
     found = sorted(
         (c for c in store.captures(f"api_catalog/{dataset}") if c.key == "metadata"),
@@ -304,11 +309,14 @@ def dataset_schema(store: RawStore, dataset: str) -> tuple[pa.Schema, list[str]]
         versions.setdefault(capture.files[0].sha256, []).append(capture)
     types: dict[str, pa.DataType] = {}
     warnings = []
+    partition_fields: list[str] = []
     for sha, copies in versions.items():
         fields = None
         for copy in copies:
             try:
-                fields = api_schema(dataset, json.loads(store.read(copy.files[0])))
+                metadata = json.loads(store.read(copy.files[0]))
+                fields = api_schema(dataset, metadata)
+                partition_fields = list(metadata.get("partitionFields") or [])
                 break
             except (*BUILD_ERRORS, KeyError, TypeError) as e:
                 problem = f"{copy.files[0].path}: {e}"
@@ -324,7 +332,7 @@ def dataset_schema(store: RawStore, dataset: str) -> tuple[pa.Schema, list[str]]
     if not types:
         raise BuildError("no readable metadata captured")
     schema = pa.schema([pa.field(name, t) for name, t in types.items()])
-    return schema, warnings
+    return schema, warnings, partition_fields
 
 
 def _remove_stale(path: Path, capture: Capture) -> None:
@@ -355,7 +363,7 @@ def build_api(
             continue
         out = parquet_dir(store) / "api" / dataset
         try:
-            schema, warnings = dataset_schema(store, dataset)
+            schema, warnings, partition_fields = dataset_schema(store, dataset)
         except BUILD_ERRORS as e:
             # Nothing can be built; drop outputs the raw store has moved past.
             for key, capture in captures.items():
@@ -363,10 +371,20 @@ def build_api(
             result.failed += 1
             result.errors.append(f"metadata: {e}")
             continue
-        for warning in warnings:
-            progress(f"{source}: warning: {warning}")
+        result.warnings += warnings
         for key, capture in sorted(captures.items()):
             path = out / f"{key}.parquet"
+            # As a set: the manifest stores the partition dict with sorted keys.
+            captured_fields = sorted(capture.meta.get("partition") or {})
+            if captured_fields != sorted(partition_fields):
+                # Partitioned differently from today (FINRA changed the
+                # partition fields): its rows would duplicate the new keys'.
+                path.unlink(missing_ok=True)
+                result.warnings.append(
+                    f"{key}: captured with partition fields {captured_fields}, "
+                    f"not {partition_fields}; left out"
+                )
+                continue
             print_ = fingerprint([capture], API_VERSION, schema.to_string())
             write = partial(_write_api, store, capture, schema, path, print_)
             label = f"{source} {key}"

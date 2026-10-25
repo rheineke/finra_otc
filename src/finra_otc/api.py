@@ -61,12 +61,12 @@ DATASETS = [
     Dataset("OTCBlocksDownloadDetails", "When each OTC blocks file was last updated"),
     Dataset(
         "weeklySummary",
-        "ATS and non-ATS (OTC) weekly volume by firm and symbol; rolling year",
+        "ATS and non-ATS (OTC) weekly volume by firm and symbol, from 2021-12",
         details="weeklyDownloadDetails",
     ),
     Dataset(
         "weeklySummaryHistoric",
-        "The weekly summary beyond the rolling year (a rolling four years)",
+        "The weekly summary, separately stored: 4 years ending a year back",
         details="weeklyDownloadDetails",
     ),
     Dataset(
@@ -476,6 +476,8 @@ def capture_catalog(
         before = _saved_json(store, previous_meta)
         if isinstance(before, dict) and before.get("partitionFields"):
             raise CaptureError(f"{dataset}: metadata lost its partition fields")
+    # Check everything before saving anything.
+    partitions = read_partitions(dataset, out["partitions"], fields)
     for key, (url, response) in responses.items():
         previous = latest.get(key)
         if previous is None or _saved_json(store, previous) != _stable(
@@ -486,21 +488,41 @@ def capture_catalog(
                 (f"{key}.json", response.content, {})
             ]
             store.save(source, key, files, meta=meta, now=now)
-    answer = out["partitions"]
-    available = answer.get("availablePartitions", []) if fields else []
+    return out["metadata"], partitions
+
+
+def read_partitions(dataset: str, answer: Any, fields: list[str]) -> list[list[str]]:
+    """Partition values, in the metadata's field order, from a partitions answer.
+
+    An unpartitioned dataset's answer is a "No partitions found" message. A
+    partitioned dataset's must list partitions: an answer without any (an
+    error body) fails, rather than quietly capturing nothing.
+    """
+    if not fields:
+        return []
+    if not isinstance(answer, dict):
+        raise CaptureError(f"{dataset}: partitions answer isn't an object")
+    available = answer.get("availablePartitions")
     order = answer.get("partitionFields") or fields
-    if sorted(order) != sorted(fields):
+    if not isinstance(available, list) or not available:
+        message = answer.get("message") or "no availablePartitions"
+        raise CaptureError(f"{dataset}: FINRA listed no partitions ({message})")
+    if not isinstance(order, list) or sorted(order) != sorted(fields):
         raise CaptureError(
             f"{dataset}: partition fields {order} don't match the metadata's {fields}"
         )
     partitions = []
     for p in available:
-        values = p["partitions"]
-        if len(values) != len(order):
-            raise CaptureError(f"{dataset}: partition {values} doesn't match {order}")
+        values = p.get("partitions") if isinstance(p, dict) else None
+        if (
+            not isinstance(values, list)
+            or len(values) != len(order)
+            or not all(isinstance(v, str) for v in values)
+        ):
+            raise CaptureError(f"{dataset}: partition {p!r} doesn't match {order}")
         by_field = dict(zip(order, values, strict=True))
         partitions.append([by_field[f] for f in fields])
-    return out["metadata"], partitions
+    return partitions
 
 
 class Stopped(CaptureError):
@@ -519,6 +541,7 @@ def capture_dataset(
     progress: Callable[[str], None] = lambda _: None,
     retries: int = 2,
     workers: int = 4,
+    accept_empty: bool = False,
 ) -> Result:
     source = f"api/{dataset.name}"
     store.sweep(source)
@@ -573,7 +596,15 @@ def capture_dataset(
                 item = running.pop(future)
                 counter = f"{dataset.name} {done}/{len(todo)}"
                 _save_result(
-                    store, source, latest, future, item, result, progress, counter
+                    store,
+                    source,
+                    latest,
+                    future,
+                    item,
+                    result,
+                    progress,
+                    counter,
+                    accept_empty,
                 )
     finally:
         # On an error or Ctrl-C, stop the fetches in flight at their next page,
@@ -592,6 +623,7 @@ def _save_result(
     result: Result,
     progress: Callable[[str], None],
     counter: str,
+    accept_empty: bool = False,
 ) -> None:
     key = partition_key(item.values)
     label = f"{counter} {key}"
@@ -602,11 +634,12 @@ def _save_result(
             meta["record_total"] == 0
             and previous is not None
             and previous.meta.get("record_total")
+            and not accept_empty
         ):
             raise CaptureError(
                 f"FINRA lists this partition but returned no rows; it had "
-                f"{previous.meta['record_total']:,}. Not saved, even with "
-                "--refresh-since."
+                f"{previous.meta['record_total']:,}. Not saved; pass "
+                "--accept-empty if FINRA really emptied it."
             )
     except (CaptureError, HttpError, ValueError, RequestException, csv.Error) as e:
         result.failed += 1
