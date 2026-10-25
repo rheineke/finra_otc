@@ -281,15 +281,12 @@ class RawStore:
         return self._commit(source, key, tmp, folder, stored, meta, now)
 
     def sweep(self, source: str, older_than: timedelta = timedelta(days=1)) -> int:
-        """Clear leftovers of interrupted captures; return how many.
+        """Delete leftovers of interrupted captures; return how many.
 
-        Unfinished capture folders (*.partial) and downloads (.scratch/*) are
-        deleted. Finished capture folders that no manifest line names (a crash
-        between the rename and the manifest append) are moved to .orphans/,
-        never deleted: the manifest itself may be the damaged part. Nothing is
-        moved while the manifest is missing or has damaged lines. Only items
-        older than ``older_than`` are touched, so a capture running alongside
-        keeps its own.
+        Only unfinished capture folders (*.partial) and downloads (.scratch/*)
+        older than ``older_than`` go, so a capture running alongside keeps its
+        own. Finished capture folders that no manifest line names are left
+        alone (the manifest may be what's damaged); ``unrecorded`` lists them.
         """
         root = self.source_dir(source)
         if not root.exists():
@@ -300,42 +297,28 @@ class RawStore:
             if _older(p, cutoff):
                 _remove(p)
                 cleared += 1
-        if not self._manifest_intact(source):
-            return cleared
+        return cleared
+
+    def unrecorded(self, source: str) -> list[Path]:
+        """Finished capture folders that no manifest line names.
+
+        A crash between the rename and the manifest append leaves one, and so
+        does a manifest restored from an older backup or damaged. Each is a
+        complete capture; nothing reads it until it's recorded again.
+        """
+        root = self.source_dir(source)
         recorded = {
             self.capture_dir(source, c.key, datetime.fromisoformat(c.captured_at))
             for c in self.captures(source)
         }
-        for folder in root.glob("*/*"):
-            if (
-                folder.parent.name.startswith(".")
-                or folder.name.endswith(".partial")
-                or folder in recorded
-                or not folder.is_dir()
-                or not _older(folder, cutoff)
-            ):
-                continue
-            dest = root / ".orphans" / folder.parent.name / folder.name
-            _make_dirs(dest.parent)
-            try:
-                folder.rename(dest)
-                cleared += 1
-            except FileNotFoundError:
-                pass  # committed or moved by another process meanwhile
-        return cleared
-
-    def _manifest_intact(self, source: str) -> bool:
-        path = self.manifest_path(source)
-        if not path.exists():
-            return False
-        with path.open() as f:
-            for line in f:
-                if line.strip():
-                    try:
-                        json.loads(line)
-                    except json.JSONDecodeError:
-                        return False
-        return True
+        return sorted(
+            folder
+            for folder in root.glob("*/*")
+            if folder.is_dir()
+            and not folder.parent.name.startswith(".")
+            and not folder.name.endswith(".partial")
+            and folder not in recorded
+        )
 
     def scratch_dir(self, source: str) -> Path:
         """Where in-progress downloads go, on the same filesystem as the store."""
@@ -370,13 +353,16 @@ class RawStore:
         _make_dirs(path.parent)
         new = not path.exists()
         line = json.dumps(record, sort_keys=True) + "\n"
+        if path.exists() and path.stat().st_size > 0:
+            with path.open("rb+") as r:
+                r.seek(-1, os.SEEK_END)
+                if r.read(1) != b"\n":
+                    # A crash mid-append left a partial record: drop it.
+                    r.seek(0)
+                    data = r.read()
+                    r.truncate(data.rfind(b"\n") + 1)
+                    _fsync(r.fileno())
         with path.open("ab") as f:
-            # End a line left partial by a crash, so this one stays readable.
-            if f.tell() > 0:
-                with path.open("rb") as r:
-                    r.seek(-1, os.SEEK_END)
-                    if r.read(1) != b"\n":
-                        line = "\n" + line
             # One write call per line, so concurrent appenders don't interleave.
             f.write(line.encode())
             f.flush()

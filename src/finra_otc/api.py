@@ -607,10 +607,15 @@ def capture_dataset(
                     accept_empty,
                 )
     finally:
-        # On an error or Ctrl-C, stop the fetches in flight at their next page,
-        # and don't start queued ones.
+        # On an error or Ctrl-C, stop the fetches in flight at their next page
+        # (or retry wait), and don't start queued ones.
         stop.set()
+        cancelled = getattr(client, "cancelled", None)
+        if isinstance(cancelled, threading.Event):
+            cancelled.set()
         pool.shutdown(wait=True, cancel_futures=True)
+        if isinstance(cancelled, threading.Event):
+            cancelled.clear()
     return result
 
 

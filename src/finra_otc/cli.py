@@ -188,6 +188,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(_cdn_summary(d))
             failures += _report(d.errors)
+            for w in d.warnings:
+                print(f"  warning: {w}", file=sys.stderr)
         if args.source == "regsho-monthly":
             m = cdn.capture_monthly(
                 client,
@@ -252,11 +254,17 @@ def _report(errors: list[str]) -> int:
 
 def status(store: RawStore) -> None:
     print(f"{'source':38} {'keys':>7} {'captures':>9} {'stored MB':>10}")
+    unrecorded = []
     for source in store.sources():
         captures = list(store.captures(source))
         keys = {c.key for c in captures}
         stored = sum(f.stored_bytes for c in captures for f in c.files)
         print(f"{source:38} {len(keys):>7,} {len(captures):>9,} {stored / 1e6:>10,.1f}")
+        unrecorded += store.unrecorded(source)
+    if unrecorded:
+        print(f"\n{len(unrecorded)} capture folders no manifest names (see README):")
+        for folder in unrecorded[:20]:
+            print(f"  {folder}")
     out = build.parquet_dir(store)
     if out.exists():
         files = list(out.glob("**/*.parquet"))

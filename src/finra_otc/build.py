@@ -309,20 +309,24 @@ def dataset_schema(
         versions.setdefault(capture.files[0].sha256, []).append(capture)
     types: dict[str, pa.DataType] = {}
     warnings = []
-    partition_fields: list[str] = []
+    # The newest readable capture's partition fields (by capture time).
+    newest: tuple[str, list[str]] | None = None
     for sha, copies in versions.items():
         fields = None
         for copy in copies:
             try:
                 metadata = json.loads(store.read(copy.files[0]))
                 fields = api_schema(dataset, metadata)
-                partition_fields = list(metadata.get("partitionFields") or [])
                 break
             except (*BUILD_ERRORS, KeyError, TypeError) as e:
                 problem = f"{copy.files[0].path}: {e}"
         if fields is None:
             warnings.append(f"skipped metadata version {sha[:12]}: {problem}")
             continue
+        partitioned = list(metadata.get("partitionFields") or [])
+        latest_copy = max(c.captured_at for c in copies)
+        if newest is None or latest_copy > newest[0]:
+            newest = (latest_copy, partitioned)
         for f in fields:
             if f.name in types and types[f.name] != f.type:
                 raise BuildError(
@@ -332,7 +336,7 @@ def dataset_schema(
     if not types:
         raise BuildError("no readable metadata captured")
     schema = pa.schema([pa.field(name, t) for name, t in types.items()])
-    return schema, warnings, partition_fields
+    return schema, warnings, newest[1] if newest is not None else []
 
 
 def _remove_stale(path: Path, capture: Capture) -> None:
@@ -372,24 +376,56 @@ def build_api(
             result.errors.append(f"metadata: {e}")
             continue
         result.warnings += warnings
-        for key, capture in sorted(captures.items()):
-            path = out / f"{key}.parquet"
-            # As a set: the manifest stores the partition dict with sorted keys.
-            captured_fields = sorted(capture.meta.get("partition") or {})
-            if captured_fields != sorted(partition_fields):
-                # Partitioned differently from today (FINRA changed the
-                # partition fields): its rows would duplicate the new keys'.
-                path.unlink(missing_ok=True)
+        current, older = _by_partitioning(captures, partition_fields)
+        # Dates the current partitioning covers; an older capture of one of
+        # those would duplicate rows, but one of a date that's gone from
+        # FINRA's window is the only copy, so it's kept.
+        covered = {_first_value(c, partition_fields) for c in current.values()}
+        for key, capture in sorted(older.items()):
+            whole = not capture.meta.get("partition")  # the dataset in one go
+            value = _first_value(capture, partition_fields)
+            if not partition_fields or (whole and current) or value in covered:
+                (out / f"{key}.parquet").unlink(missing_ok=True)
                 result.warnings.append(
-                    f"{key}: captured with partition fields {captured_fields}, "
-                    f"not {partition_fields}; left out"
+                    f"{key}: captured under older partition fields "
+                    f"{sorted(capture.meta.get('partition') or {})}; replaced by "
+                    "newer captures, left out"
                 )
-                continue
+            else:
+                current[key] = capture
+        for key, capture in sorted(current.items()):
+            path = out / f"{key}.parquet"
             print_ = fingerprint([capture], API_VERSION, schema.to_string())
             write = partial(_write_api, store, capture, schema, path, print_)
             label = f"{source} {key}"
             build_one(result, path, print_, label, write, progress, force)
     return results
+
+
+def _by_partitioning(
+    captures: dict[str, Capture], fields: list[str]
+) -> tuple[dict[str, Capture], dict[str, Capture]]:
+    """Split captures into those made under ``fields`` and the rest."""
+    current, older = {}, {}
+    for key, capture in captures.items():
+        partition = capture.meta.get("partition") or {}
+        # Compare as sets: the manifest stores the dict with sorted keys.
+        if (
+            sorted(partition) == sorted(fields)
+            and api.partition_key([partition[f] for f in fields]) == key
+        ):
+            current[key] = capture
+        else:
+            older[key] = capture
+    return current, older
+
+
+def _first_value(capture: Capture, fields: list[str]) -> str | None:
+    """The capture's value of the first (date) partition field, if it has one."""
+    if not fields:
+        return None
+    value = (capture.meta.get("partition") or {}).get(fields[0])
+    return value if isinstance(value, str) else None
 
 
 def _write_api(

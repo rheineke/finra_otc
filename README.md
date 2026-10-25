@@ -58,7 +58,10 @@ in `absent.jsonl`. A miss is a 403 carrying the storage bucket's
 `AccessDenied` error; any other refusal counts as a failure, so a bot block
 can't mark files missing. A daily file missing on a trading day (a date the
 API's `regShoDaily` lists) is also reported as a failure, so a CDN that stops
-serving files makes the run fail instead of going quiet. A miss isn't asked for again once the file is overdue (a
+serving files makes the run fail instead of going quiet. That list comes from
+the API capture, so schedule `capture all` (or `capture api regShoDaily`
+too); `capture regsho-daily` warns when the list is missing or over 5 days
+old. A miss isn't asked for again once the file is overdue (a
 week for daily files, 45 days after month end for monthly ones), unless you
 pass `--recheck-absent`. Recent files (the last 10 days, the last 2 months) are
 checked again by ETag, because FINRA sometimes reposts them.
@@ -78,6 +81,39 @@ that history. `capture legacy <folder>` imports them (a folder of
 - The ADF and ORF trade-reporting APIs aren't part of the FINRA API platform.
 - No source covers weekly OTC Transparency data from mid-2018 to late 2021.
 
+## Using the tables
+
+Several tables repeat the same volume at different levels, so a plain `sum`
+overcounts:
+
+- **`weeklySummary`, `weeklySummaryHistoric` and `monthlySummary`.** Each
+  week (or month) and tier holds three levels, told apart by
+  `summaryTypeCode`: by symbol and firm (`ATS_W_SMBL_FIRM`,
+  `OTC_W_SMBL_FIRM`; `OTC_M_*` monthly), by symbol (`*_SMBL`) and by firm
+  (`*_FIRM`). Each level adds up to the same total (to within rounding), so
+  pick one. `ATS_*` rows are ATS volume and `OTC_*` rows non-ATS volume; those
+  don't overlap.
+- **The tiers.** Weekly tiers T1, T2 and OTCE don't overlap. The weekly NMS
+  tier (17 weeks in 2023, and the 2022 historic weeks) is T1 and T2 combined,
+  so don't add it to them. The NA tier holds market-wide totals
+  (`*_W_VOL_STATS`, by `productTypeCode`), not firms. Monthly data has just
+  two tiers, NMS and OTCE, which don't overlap.
+- **The two weekly datasets** overlap; see above.
+- **`blocksSummary` and `otcBlocksSummary`.** There is one row per firm and
+  size bucket (`summaryTypeCode`). The firm's overall columns
+  (`totalShareQuantity`, `totalTradeCount` and the rest) repeat in every
+  bucket's row; only the block columns differ.
+- **Reg SHO daily volume.** `CNMS` is the consolidated file: exactly the sum of
+  FNQC, FNSQ and FNYX (and the ADF), so add up either CNMS or the others,
+  not both. `api/regShoDaily` holds the same numbers as the CDN files for the
+  last year, with its own facility codes: `NCTRF` = FNQC, `NQTRF` = FNSQ,
+  `NYTRF` = FNYX and `ORF` = FORF. It has no CNMS or ADF rows. Use
+  `regsho_daily` for history and avoid unioning the two.
+- **Short interest.** `equityShortInterest` (OTC securities, to 2022-09)
+  overlaps the OTC rows of `consolidatedShortInterest` from 2017-12 to
+  2022-09.
+- **The legacy weekly files** (2014-2018) don't overlap the API's weeks.
+
 ## Layout
 
 ```
@@ -85,7 +121,6 @@ data/raw/<source>/<key>/<captured_at>/<file>[.gz]   files exactly as received
 data/raw/<source>/manifest.jsonl                    one line per complete capture
 data/raw/<source>/absent.jsonl                      CDN files found missing
 data/raw/<source>/checks.jsonl                      API re-fetches that found no change
-data/raw/<source>/.orphans/                         capture folders no manifest line names
 data/parquet/api/<dataset>/<partition>.parquet
 data/parquet/cdn/regsho_daily/<facility>/<YYYY-MM>.parquet
 data/parquet/cdn/regsho_monthly/<facility>sh<YYYYMM>[_<part>].parquet
@@ -100,11 +135,13 @@ Text is gzipped on disk, and ZIPs are stored as-is. Nothing is overwritten:
 when a partition or file changes, the new version is saved next to the old one,
 and the manifest says which is newest. Files are written and synced to disk
 (F_FULLFSYNC on macOS) first and the manifest line last, so an interrupted
-capture leaves nothing half-recorded. Each capture command deletes unfinished
-folders and downloads more than a day old, and moves finished folders that
-no manifest line names (a crash just before the manifest append) to
-`.orphans/`. It never deletes those, and leaves them alone while the manifest
-is missing or damaged, since then the manifest is what's wrong. Reads
+capture leaves nothing half-recorded, and a record torn by a crash mid-append
+is dropped at the next append. Each capture command deletes unfinished folders
+and downloads more than a day old. Finished folders that no manifest line
+names (a crash just before the manifest append, or a manifest restored from
+an older backup) are never touched; `status` lists them. Each is a complete
+capture, so it can be recovered by appending its line back to the manifest.
+Reads
 check every file against the SHA-256 in the manifest. A damaged file is
 replaced the next time the same data is fetched: on any run for recent data,
 or with `--refresh-since` for older data (monthly ZIPs are only size-checked
@@ -163,7 +200,7 @@ updating the details a day before the data; a longer lag would be missed until
 the next republication or a `--refresh-since`. A full first API
 capture is a few GB and takes hours. `weeklySummaryHistoric` is the slow part,
 at about 3 seconds a page; `--workers` (default 4) sets how many partitions
-are fetched at once, and Ctrl-C stops them at their next page. A failed partition, file or dataset (including dropped
+are fetched at once, and Ctrl-C stops them at their next page or retry wait. A failed partition, file or dataset (including dropped
 connections, after retries) is reported and skipped, and the command exits
 with status 1. `build` also prints warnings (even with `-q`) for things it
 leaves out without failing: unreadable metadata versions, and partitions

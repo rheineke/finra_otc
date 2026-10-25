@@ -69,6 +69,10 @@ class HttpClient(Protocol):
     def download(self, url: str, dest: Path) -> Download: ...
 
 
+class Cancelled(requests.RequestException):
+    """A retry wait was cut short because the capture is stopping."""
+
+
 class HttpError(RuntimeError):
     def __init__(
         self,
@@ -105,7 +109,10 @@ class RequestsClient:
     backoff: float = 2.0
     session: requests.Session = field(default_factory=requests.Session)
     clock: Callable[[], float] = time.monotonic
-    sleep: Callable[[float], None] = time.sleep
+    # None: wait on ``cancelled`` (so Ctrl-C cuts retry waits short).
+    sleep: Callable[[float], None] | None = None
+    # Set to abandon retries in progress (Ctrl-C); waits wake up at once.
+    cancelled: threading.Event = field(default_factory=threading.Event)
     _last: float | None = field(default=None, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
 
@@ -206,7 +213,11 @@ class RequestsClient:
                 delay = max(delay, float(retry_after))
             except ValueError:
                 pass
-        self.sleep(min(delay, MAX_BACKOFF))
+        delay = min(delay, MAX_BACKOFF)
+        if self.sleep is not None:
+            self.sleep(delay)
+        elif self.cancelled.wait(delay):
+            raise Cancelled("retry abandoned: the capture is stopping")
 
     def _wait(self) -> None:
         # Threads share the client, so requests are spaced out across all of them.
@@ -215,6 +226,6 @@ class RequestsClient:
             if self._last is not None:
                 remaining = self.min_interval - (now - self._last)
                 if remaining > 0:
-                    self.sleep(remaining)
+                    (self.sleep or time.sleep)(remaining)
                     now += remaining
             self._last = now

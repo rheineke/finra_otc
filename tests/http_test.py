@@ -58,3 +58,14 @@ def test_client_errors_are_not_retried() -> None:
         c.get("https://x")
     assert e.value.status == 403 and e.value.body == b"<Error/>"
     assert session.calls == 1
+
+
+def test_a_cancelled_client_abandons_its_retry_wait() -> None:
+    from finra_otc.http import Cancelled
+
+    session = FakeSession([FakeResponse(503), FakeResponse(200)])
+    c = RequestsClient(session=session, retries=2, backoff=60)  # type: ignore[arg-type]
+    c.cancelled.set()
+    with pytest.raises(Cancelled):
+        c.get("https://x")
+    assert session.calls == 1

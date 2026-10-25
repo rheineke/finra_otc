@@ -455,3 +455,43 @@ def test_partition_field_order_in_the_manifest_doesnt_matter(tmp_path: Path) -> 
     store.save("api/weeklySummary", "k", files, meta=meta, now=NOW)
     [r] = build.build_api(store, ["weeklySummary"])
     assert (r.built, r.warnings) == (1, [])
+
+
+def test_older_partitioning_history_is_kept_when_nothing_replaces_it(
+    tmp_path: Path,
+) -> None:
+    store = RawStore(tmp_path)
+    two = json.loads(json.dumps(METADATA))
+    two["partitionFields"] = ["weekStartDate", "MPID"]
+    save_catalog(store, "weeklySummary", METADATA)
+    # Captured under the old partitioning; FINRA has since dropped this week.
+    save_partition(store, "weeklySummary", "2026-09-14", [PAGE])
+    later = NOW.replace(hour=18)
+    content = json.dumps(two).encode()
+    files: list[tuple[str, bytes, dict[str, Any]]] = [("m.json", content, {})]
+    store.save("api_catalog/weeklySummary", "metadata", files, now=later)
+    page = [("offset-0000000.csv", PAGE, {"rows": 2})]
+    meta = {
+        "record_total": 2,
+        "partition": {"weekStartDate": "2026-09-21", "MPID": "A"},
+    }
+    store.save("api/weeklySummary", "2026-09-21_A", page, meta=meta, now=later)
+    [r] = build.build_api(store, ["weeklySummary"])
+    assert (r.built, r.warnings) == (2, [])
+
+
+def test_partition_fields_come_from_the_newest_metadata(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    b = json.loads(json.dumps(METADATA))
+    b["partitionFields"] = ["weekStartDate", "MPID"]
+    for hour, version in ((10, METADATA), (11, b), (12, METADATA)):  # A, B, A
+        content = json.dumps(version).encode()
+        files: list[tuple[str, bytes, dict[str, Any]]] = [("m.json", content, {})]
+        store.save(
+            "api_catalog/weeklySummary", "metadata", files, now=NOW.replace(hour=hour)
+        )
+    save_partition(
+        store, "weeklySummary", "2026-09-14", [PAGE], now=NOW.replace(hour=13)
+    )
+    [r] = build.build_api(store, ["weeklySummary"])
+    assert (r.built, r.warnings) == (1, [])

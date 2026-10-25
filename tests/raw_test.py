@@ -102,8 +102,9 @@ def test_append_after_a_partial_line_keeps_the_manifest_readable(
     with store.manifest_path("s").open("a") as f:
         f.write('{"source": "s", "key": "broken"')  # crash mid-append
     store.save("s", "k2", [("f", b"b", {})], now=NOW.replace(second=1))
-    with pytest.warns(UserWarning, match="damaged line"):
-        assert set(store.latest("s")) == {"k1", "k2"}
+    # The torn record is dropped, so the manifest is whole again.
+    assert set(store.latest("s")) == {"k1", "k2"}
+    assert "broken" not in store.manifest_path("s").read_text()
 
 
 def test_latest_is_by_capture_time_not_manifest_order(tmp_path: Path) -> None:
@@ -145,7 +146,7 @@ def test_sweep_removes_old_leftovers_only(tmp_path: Path) -> None:
     assert store.latest("s")
 
 
-def test_sweep_removes_old_unrecorded_capture_folders(tmp_path: Path) -> None:
+def test_sweep_leaves_unrecorded_capture_folders(tmp_path: Path) -> None:
     import os
     import time
 
@@ -157,23 +158,7 @@ def test_sweep_removes_old_unrecorded_capture_folders(tmp_path: Path) -> None:
     two_days_ago = time.time() - 2 * 86400
     os.utime(orphan, (two_days_ago, two_days_ago))
     os.utime(store.path(kept.files[0]).parent, (two_days_ago, two_days_ago))
-    assert store.sweep("s") == 1
-    assert not orphan.exists() and store.read(kept.files[0]) == b"a"
-    # Moved aside, not deleted.
-    assert (store.source_dir("s") / ".orphans" / "k" / orphan.name / "f.gz").exists()
-
-
-def test_sweep_moves_nothing_when_the_manifest_is_damaged(tmp_path: Path) -> None:
-    import os
-    import time
-
-    store = RawStore(tmp_path)
-    kept = store.save("s", "k", [("f", b"a", {})], now=NOW)
-    old = time.time() - 2 * 86400
-    os.utime(store.path(kept.files[0]).parent, (old, old))
-    manifest = store.manifest_path("s")
-    manifest.write_text("{damaged\n" + manifest.read_text())
+    # Left alone (the manifest may be what's wrong), but listed.
     assert store.sweep("s") == 0
-    manifest.unlink()
-    assert store.sweep("s") == 0
-    assert store.path(kept.files[0]).exists()
+    assert orphan.exists() and store.read(kept.files[0]) == b"a"
+    assert store.unrecorded("s") == [orphan]

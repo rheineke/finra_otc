@@ -48,12 +48,16 @@ def is_missing(e: HttpError) -> bool:
 
 
 def _intact(store: RawStore, capture: Capture, *, full: bool) -> bool:
-    """Is the saved copy still good? ``full`` reads and hashes it; otherwise
-    (multi-GB ZIPs) only its size is checked, and the build verifies it."""
+    """Is the saved copy still good? ``full`` hashes it (streaming files stored
+    as-is); otherwise (multi-GB ZIPs) only its size is checked, and the build
+    verifies it."""
     try:
         if full:
             for f in capture.files:
-                store.read(f)
+                if f.path.endswith(".gz"):
+                    store.read(f)
+                else:
+                    store.verify(f)
             return True
         return all(
             store.path(f).stat().st_size == f.stored_bytes for f in capture.files
@@ -105,21 +109,29 @@ class Result:
     failed: int = 0
     bytes: int = 0
     errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
-def trading_days(store: RawStore) -> set[date]:
-    """Trade dates the API's regShoDaily lists (about a year), if captured."""
+def trading_days(store: RawStore) -> tuple[set[date], datetime | None]:
+    """Trade dates the API's regShoDaily lists (about a year), and when that
+    list was last fetched; empty and None if it never was."""
     capture = store.latest("api_catalog/regShoDaily").get("partitions")
     if capture is None:
-        return set()
+        return set(), None
     try:
         answer = json.loads(store.read(capture.files[0]))
-        return {
+        days = {
             date.fromisoformat(p["partitions"][0])
             for p in answer.get("availablePartitions") or []
         }
     except OSError, ValueError, KeyError, TypeError, IndexError:
-        return set()
+        return set(), None
+    # The list is saved only when it changes; a fetch that found it unchanged
+    # still counts, and the regShoDaily captures show when fetches happened.
+    fetched = [capture.captured_at]
+    fetched += [c.captured_at for c in store.latest("api/regShoDaily").values()]
+    fetched += [c["checked_at"] for c in store.checks("api/regShoDaily").values()]
+    return days, max(datetime.fromisoformat(t) for t in fetched)
 
 
 def daily_problem(content: bytes) -> str | None:
@@ -199,14 +211,20 @@ def capture_daily(
     is a failure as well as an absence, so a CDN that stops serving files
     can't go unnoticed.
     """
+    result = Result(DAILY_SOURCE)
     if trading is None:
-        trading = trading_days(store)
+        trading, listed_at = trading_days(store)
+        stale = listed_at is None or now() - listed_at > timedelta(days=5)
+        if stale:
+            result.warnings.append(
+                "no recent list of trading days, so missing files can't be told "
+                "from holidays; run `capture api regShoDaily` (or `capture all`)"
+            )
     today = now().astimezone(FINRA_TZ).date()
     end = min(until or today, today)
     store.sweep(DAILY_SOURCE)
     latest = store.latest(DAILY_SOURCE)
     absent = store.absences(DAILY_SOURCE)
-    result = Result(DAILY_SOURCE)
     for facility in facilities or list(DAILY_FACILITIES):
         start = max(since or DAILY_FACILITIES[facility], DAILY_FACILITIES[facility])
         for day in weekdays(start, end):

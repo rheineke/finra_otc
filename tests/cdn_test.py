@@ -267,7 +267,8 @@ def test_trading_days_come_from_the_regshodaily_catalog(tmp_path: Path) -> None:
     answer = {"availablePartitions": [{"partitions": ["2026-10-21"]}]}
     content = json.dumps(answer).encode()
     store.save("api_catalog/regShoDaily", "partitions", [("p.json", content, {})])
-    assert cdn.trading_days(store) == {date(2026, 10, 21)}
+    days, fetched = cdn.trading_days(store)
+    assert days == {date(2026, 10, 21)} and fetched is not None
 
 
 def test_refresh_since_fully_verifies_monthly_zips(tmp_path: Path) -> None:
@@ -292,3 +293,14 @@ def test_refresh_since_fully_verifies_monthly_zips(tmp_path: Path) -> None:
     store.path(saved).write_bytes(bytes(data))
     assert run().unchanged == 1  # a size check can't see it
     assert run(refresh_since=month).saved == 1
+
+
+def test_warns_without_a_recent_trading_day_list(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    day = date(2026, 10, 22)
+    url = cdn.daily_url("FORF", day)
+    client = FakeClient(routes={url: response(url, DAILY)})
+    r = cdn.capture_daily(
+        client, store, since=day, until=day, facilities=["FORF"], now=lambda: at(day)
+    )
+    assert r.saved == 1 and "trading days" in r.warnings[0]
