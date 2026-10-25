@@ -118,6 +118,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         client = RequestsClient()
         if args.source in ("api", "all"):
             wanted = set(getattr(args, "datasets", None) or api.BY_NAME)
+            # A dataset's details listing says what FINRA republished; refresh it.
+            wanted |= {api.BY_NAME[n].details for n in wanted} - {None}  # type: ignore[arg-type]
             # Always in DATASETS order, so details datasets are fresh first.
             for name in [d.name for d in api.DATASETS if d.name in wanted]:
                 try:
@@ -131,7 +133,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                         workers=getattr(args, "workers", 4),
                         progress=progress,
                     )
-                except (api.CaptureError, HttpError, RequestException, ValueError) as e:
+                except (
+                    api.CaptureError,
+                    HttpError,
+                    RequestException,
+                    OSError,
+                    ValueError,
+                ) as e:
                     # The catalog failed; carry on with the other datasets.
                     print(f"{name}: FAILED", file=sys.stderr)
                     failures += _report([str(e)])
@@ -167,8 +175,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(_cdn_summary(m, dry_run=args.dry_run))
             failures += _report(m.errors)
         if args.source == "legacy":
-            saved, skipped = legacy.import_legacy(store, args.folder, progress=progress)
-            print(f"legacy weekly: {saved} saved, {skipped} already captured")
+            li = legacy.import_legacy(store, args.folder, progress=progress)
+            print(
+                f"legacy weekly: {li.saved} saved, {li.already} already captured, "
+                f"{len(li.ignored)} ignored"
+            )
+            failures += _report([f"not a legacy file name: {n}" for n in li.ignored])
     elif args.command == "build":
         parts = args.parts or BUILD_PARTS
         results: list[build.Result] = []

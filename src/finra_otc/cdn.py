@@ -19,6 +19,7 @@ had time to post them.
 
 import uuid
 import zipfile
+import zlib
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -90,6 +91,18 @@ class Result:
     errors: list[str] = field(default_factory=list)
 
 
+def daily_problem(content: bytes) -> str | None:
+    """Why a daily file is unusable (wrong kind, cut short), or None."""
+    if not content.startswith(DAILY_HEADER):
+        return "not a short-sale volume file"
+    lines = [line for line in content.splitlines() if line.strip()]
+    footer = lines[-1].strip()
+    # Every file ends with its row count; a file posted partway doesn't.
+    if not footer.isdigit() or int(footer) != len(lines) - 2:
+        return "row-count footer missing or wrong (cut short?)"
+    return None
+
+
 def daily_name(facility: str, day: date) -> str:
     return f"{facility}shvol{day:%Y%m%d}"
 
@@ -149,6 +162,7 @@ def capture_daily(
     """Fetch daily files not yet captured; re-check recent ones for updates."""
     today = now().astimezone(FINRA_TZ).date()
     end = min(until or today, today)
+    store.sweep(DAILY_SOURCE)
     latest = store.latest(DAILY_SOURCE)
     absent = store.absences(DAILY_SOURCE)
     result = Result(DAILY_SOURCE)
@@ -190,9 +204,10 @@ def capture_daily(
                 result.failed += 1
                 result.errors.append(f"{key}: {e}")
                 continue
-            if not response.content.startswith(DAILY_HEADER):
+            problem = daily_problem(response.content)
+            if problem is not None:
                 result.failed += 1
-                result.errors.append(f"{key}: not a short-sale volume file")
+                result.errors.append(f"{key}: {problem}; not saved")
                 continue
             if previous is not None and previous.sha256s == [
                 Capture.sha_of(response.content)
@@ -236,6 +251,7 @@ def capture_monthly(
     today = now().astimezone(FINRA_TZ).date()
     last_month = today.replace(day=1) - timedelta(days=1)
     end = min(until or last_month, last_month)
+    store.sweep(MONTHLY_SOURCE)
     latest = store.latest(MONTHLY_SOURCE)
     absent = store.absences(MONTHLY_SOURCE)
     result = Result(MONTHLY_SOURCE)
@@ -292,7 +308,16 @@ def capture_monthly(
                         result.saved += 1
                         result.bytes += size
                         progress(f"{key}: {size:,} bytes")
-                    except (HttpError, RequestException, OSError, ValueError) as e:
+                    except (
+                        HttpError,
+                        RequestException,
+                        OSError,
+                        ValueError,
+                        EOFError,
+                        NotImplementedError,  # a compression method zipfile lacks
+                        zipfile.BadZipFile,
+                        zlib.error,
+                    ) as e:
                         result.failed += 1
                         result.errors.append(f"{key}: {e}")
                 if part is None:

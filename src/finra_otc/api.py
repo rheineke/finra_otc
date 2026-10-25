@@ -301,7 +301,10 @@ def details_rows(store: RawStore, details: str) -> list[dict[str, str | None]]:
     capture = store.latest(f"api/{details}").get(UNPARTITIONED_KEY)
     if capture is None:
         return []
-    return [row for f in capture.files for row in csv_rows(store.read(f))]
+    try:
+        return [row for f in capture.files for row in csv_rows(store.read(f))]
+    except OSError as e:
+        raise CaptureError(f"{details}: {e}; capture it again") from e
 
 
 def csv_rows(content: bytes) -> list[dict[str, str | None]]:
@@ -384,6 +387,18 @@ class Result:
     errors: list[str] = field(default_factory=list)
 
 
+def _unchanged(store: RawStore, previous: Capture, files: list[_File]) -> bool:
+    """Same bytes as the previous capture, which is still intact on disk."""
+    if previous.sha256s != [Capture.sha_of(content) for _, content, _ in files]:
+        return False
+    try:
+        for f in previous.files:
+            store.read(f)
+    except OSError:
+        return False  # damaged: save the fresh copy as a new capture
+    return True
+
+
 def _fetch_with_retries(
     client: HttpClient, dataset: Dataset, fields: list[str], item: Plan, retries: int
 ) -> tuple[list[tuple[str, bytes, Mapping[str, Any]]], dict[str, Any]]:
@@ -394,6 +409,21 @@ def _fetch_with_retries(
             if attempt == retries:
                 raise
     raise AssertionError("unreachable")
+
+
+def _stable(content: bytes) -> Any:
+    """JSON without the per-request ID that FINRA puts in some answers."""
+    value = json.loads(content)
+    if isinstance(value, dict):
+        value.pop("requestId", None)
+    return value
+
+
+def _saved_json(store: RawStore, capture: Capture) -> Any:
+    try:
+        return _stable(store.read(capture.files[0]))
+    except OSError, ValueError:
+        return None  # damaged: save the fresh copy
 
 
 def capture_catalog(
@@ -410,8 +440,9 @@ def capture_catalog(
         response = client.get(url)
         out[key] = _json(response)
         previous = latest.get(key)
-        sha = Capture.sha_of(response.content)
-        if previous is None or previous.sha256s != [sha]:
+        if previous is None or _saved_json(store, previous) != _stable(
+            response.content
+        ):
             meta = {"url": url, "content_type": response.header("Content-Type")}
             files: list[tuple[str, bytes, dict[str, Any]]] = [
                 (f"{key}.json", response.content, {})
@@ -436,6 +467,7 @@ def capture_dataset(
     workers: int = 4,
 ) -> Result:
     source = f"api/{dataset.name}"
+    store.sweep(source)
     metadata, partitions = capture_catalog(client, store, dataset.name, now())
     fields: list[str] = metadata.get("partitionFields") or []
     if not fields:
@@ -460,13 +492,18 @@ def capture_dataset(
     )
     result = Result(dataset.name, planned=len(todo))
 
-    def fetch(item: Plan) -> tuple[list[_File], dict[str, Any]]:
-        return _fetch_with_retries(client, dataset, fields, item, retries)
+    def fetch(item: Plan) -> tuple[list[_File], dict[str, Any], datetime]:
+        # Stamp captures with when the fetch began: a republish dated that day
+        # may have landed while it ran, and the planner must still see it.
+        started = now()
+        files, meta = _fetch_with_retries(client, dataset, fields, item, retries)
+        return files, meta, started
 
     # Partitions are fetched in parallel and saved in order, by this thread only.
     pool = ThreadPoolExecutor(max_workers=max(1, workers))
     try:
-        window: deque[tuple[Plan, Future[tuple[list[_File], dict[str, Any]]]]] = deque()
+        window: deque[tuple[Plan, Future[tuple[list[_File], dict[str, Any], datetime]]]]
+        window = deque()
         pending = iter(todo)
         done = 0
         while True:
@@ -482,22 +519,29 @@ def capture_dataset(
             key = partition_key(item.values)
             label = f"{dataset.name} {done}/{len(todo)} {key}"
             try:
-                files, meta = future.result()
+                files, meta, started = future.result()
+                previous = latest.get(key)
+                if (
+                    meta["record_total"] == 0
+                    and previous is not None
+                    and previous.meta.get("record_total")
+                ):
+                    raise CaptureError(
+                        f"FINRA lists this partition but returned no rows; it "
+                        f"had {previous.meta['record_total']:,}. Not saved."
+                    )
             except (CaptureError, HttpError, ValueError, RequestException) as e:
                 result.failed += 1
                 result.errors.append(f"{key}: {e}")
                 progress(f"{label}: FAILED {e}")
                 continue
-            previous = latest.get(key)
-            if previous is not None and previous.sha256s == [
-                Capture.sha_of(content) for _, content, _ in files
-            ]:
+            if previous is not None and _unchanged(store, previous, files):
                 result.unchanged += 1
-                store.record_check(source, key, now(), reason=item.reason)
+                store.record_check(source, key, started, reason=item.reason)
                 progress(f"{label}: unchanged")
                 continue
             meta["reason"] = item.reason
-            store.save(source, key, files, meta=meta, now=now())
+            store.save(source, key, files, meta=meta, now=started)
             result.saved += 1
             progress(f"{label}: {meta['record_total']:,} rows")
     finally:

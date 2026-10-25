@@ -268,8 +268,11 @@ def test_legacy_import_and_build(tmp_path: Path) -> None:
     )
     write_legacy(src, "2018-08-06_OTC_OTCE_2018-09-01 00:00:00.csv", OTC_FILE)
     store = RawStore(tmp_path / "data")
-    assert legacy.import_legacy(store, src, now=lambda: NOW) == (3, 0)
-    assert legacy.import_legacy(store, src, now=lambda: NOW) == (0, 3)
+    (src / "2014" / "notes.csv").write_text("x")
+    first = legacy.import_legacy(store, src, now=lambda: NOW)
+    assert (first.saved, first.already, len(first.ignored)) == (3, 0, 1)
+    again = legacy.import_legacy(store, src, now=lambda: NOW)
+    assert (again.saved, again.already) == (0, 3)
     r = build.build_legacy(store)
     assert (r.built, r.rows) == (2, 3)
     t2014 = pq.read_table(tmp_path / "data/parquet/legacy/weekly/2014.parquet")
@@ -338,8 +341,37 @@ def test_each_capture_uses_the_metadata_of_its_time(tmp_path: Path) -> None:
     )
     [r] = build.build_api(store, ["weeklySummary"])
     assert (r.built, r.failed) == (2, 0), r.errors
-    old = pq.read_table(tmp_path / "parquet/api/weeklySummary/old.parquet")
-    assert "MPID" in old.schema.names
+    # Both files have every column, so a directory read keeps them all.
+    out = tmp_path / "parquet/api/weeklySummary"
+    names = ["weekStartDate", "MPID", "firmCRDNumber", "totalWeeklyShareQuantity",
+             "marketParticipantID"]  # fmt: skip
+    for key in ("old", "new"):
+        assert pq.read_schema(out / f"{key}.parquet").names == names
+    table = pq.read_table(out).sort_by("weekStartDate")
+    # PAGE's second row is null either way; the rest come from the other file.
+    assert table.column("MPID").null_count == 3
+    assert table.column("marketParticipantID").null_count == 3
+
+
+def test_a_field_changing_type_fails_and_drops_stale_outputs(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    save_catalog(store, "weeklySummary", METADATA)
+    save_partition(store, "weeklySummary", "k", [PAGE])
+    build.build_api(store, ["weeklySummary"])
+    changed = json.loads(json.dumps(METADATA))
+    changed["fields"][1]["type"] = "Number"  # MPID
+    content = json.dumps(changed).encode()
+    later = NOW.replace(hour=18)
+    store.save(
+        "api_catalog/weeklySummary", "metadata", [("m.json", content, {})], now=later
+    )
+    out = tmp_path / "parquet/api/weeklySummary/k.parquet"
+    [r] = build.build_api(store, ["weeklySummary"])
+    assert r.failed == 1 and "changed type" in r.errors[0]
+    assert out.exists()  # still built from the newest capture
+    save_partition(store, "weeklySummary", "k", [PAGE], now=later.replace(minute=5))
+    build.build_api(store, ["weeklySummary"])
+    assert not out.exists()  # the raw store has moved past it
 
 
 def test_link_indicator_padding_is_null(tmp_path: Path) -> None:
@@ -357,3 +389,14 @@ def test_legacy_file_without_footer_fails(tmp_path: Path) -> None:
     legacy.import_legacy(store, src, now=lambda: NOW)
     r = build.build_legacy(store)
     assert r.failed == 1 and "footer" in r.errors[0]
+
+
+def test_line_breaks_in_quoted_values_survive_big_pages(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    save_catalog(store, "weeklySummary", METADATA)
+    header = PAGE.split(b"\n")[0] + b"\n"
+    body = b'"2026-09-14","two\nlines","1","2"\n' * 30_000  # over pyarrow's 1 MB block
+    files = [("offset-0000000.csv", header + body, {"rows": 30_000})]
+    store.save("api/weeklySummary", "k", files, meta={"record_total": 30_000}, now=NOW)
+    [r] = build.build_api(store, ["weeklySummary"])
+    assert (r.built, r.rows) == (1, 30_000), r.errors

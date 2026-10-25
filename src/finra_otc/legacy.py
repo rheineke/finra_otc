@@ -13,7 +13,7 @@ import datetime as dt
 import io
 import re
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -56,6 +56,13 @@ DATE_FORMATS: list[Any] = [pv.ISO8601, "%d-%b-%y"]
 _NAME = re.compile(
     r"(\d{4}-\d{2}-\d{2})_(ATS|OTC)_(.+)_(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
 )
+
+
+@dataclass
+class ImportResult:
+    saved: int = 0
+    already: int = 0
+    ignored: list[str] = field(default_factory=list)  # names not understood
 
 
 @dataclass(frozen=True)
@@ -102,16 +109,20 @@ def import_legacy(
     *,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     progress: Callable[[str], None] = lambda _: None,
-) -> tuple[int, int]:
-    """Copy legacy files into the raw store; (saved, already there)."""
+) -> ImportResult:
+    """Copy legacy files into the raw store."""
     latest = store.latest(SOURCE)
-    saved = skipped = 0
+    result = ImportResult()
     for path in legacy_files(folder):
-        info = parse_filename(path.stem)
+        try:
+            info = parse_filename(path.stem)
+        except ValueError:
+            result.ignored.append(str(path))
+            continue
         content = path.read_bytes()
         previous = latest.get(info.key)
-        if previous is not None and previous.sha256s == [Capture.sha_of(content)]:
-            skipped += 1
+        if previous is not None and _intact_copy(store, previous, content):
+            result.already += 1
             continue
         meta = {
             "original_name": path.name,
@@ -124,9 +135,19 @@ def import_legacy(
             (f"{info.key}.csv", content, {})
         ]
         store.save(SOURCE, info.key, files, meta=meta, now=now())
-        saved += 1
+        result.saved += 1
         progress(path.name)
-    return saved, skipped
+    return result
+
+
+def _intact_copy(store: RawStore, previous: Capture, content: bytes) -> bool:
+    if previous.sha256s != [Capture.sha_of(content)]:
+        return False
+    try:
+        store.read(previous.files[0])
+    except OSError:
+        return False  # damaged: import it again
+    return True
 
 
 def latest_versions(captures: list[Capture]) -> list[Capture]:
@@ -157,7 +178,9 @@ def read_table(content: bytes, week: dt.date, category: str) -> pa.Table:
         types[name] = pa.timestamp("s")
     table = pv.read_csv(
         io.BytesIO(content),
-        parse_options=pv.ParseOptions(delimiter="|", invalid_row_handler=skip_footer),
+        parse_options=pv.ParseOptions(
+            delimiter="|", newlines_in_values=True, invalid_row_handler=skip_footer
+        ),
         convert_options=pv.ConvertOptions(
             column_types=types,
             timestamp_parsers=DATE_FORMATS,

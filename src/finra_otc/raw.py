@@ -14,22 +14,26 @@ of an API query.
 
 Text is gzip-compressed on disk; gunzipping returns the bytes exactly as
 received. Files that are already compressed (ZIPs) are stored as-is. Files are
-written and synced to disk first and the manifest line last, so a capture
-missing from the manifest is incomplete and is ignored. Reads check each file
-against the SHA-256 in the manifest. Nothing is ever overwritten.
+written and synced to disk (F_FULLFSYNC on macOS) first and the manifest line
+last, so a capture missing from the manifest is incomplete and is ignored.
+Reads check each file against the SHA-256 in the manifest. Nothing is ever
+overwritten.
 """
 
+import fcntl
 import gzip
 import hashlib
 import json
 import os
 import re
 import shutil
+import sys
+import time
 import warnings
 import zlib
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -222,7 +226,7 @@ class RawStore:
         if folder.exists():
             raise FileExistsError(folder)
         shutil.rmtree(tmp, ignore_errors=True)
-        tmp.mkdir(parents=True)
+        _make_dirs(tmp)
         stored = []
         for name, content, file_meta in files:
             stored_name = check_name(name) + (".gz" if compress else "")
@@ -259,10 +263,10 @@ class RawStore:
         if folder.exists():
             raise FileExistsError(folder)
         shutil.rmtree(tmp, ignore_errors=True)
-        tmp.mkdir(parents=True)
+        _make_dirs(tmp)
         size = downloaded.stat().st_size
         with downloaded.open("rb+") as f:
-            os.fsync(f.fileno())
+            _fsync(f.fileno())
         downloaded.replace(tmp / check_name(name))
         stored = [
             StoredFile(
@@ -275,6 +279,25 @@ class RawStore:
             )
         ]
         return self._commit(source, key, tmp, folder, stored, meta, now)
+
+    def sweep(self, source: str, older_than: timedelta = timedelta(days=1)) -> int:
+        """Remove leftovers of interrupted captures; return how many.
+
+        Unfinished capture folders (*.partial) and downloads (.scratch/*) that
+        are older than ``older_than``, so that a running capture keeps its own.
+        """
+        root = self.source_dir(source)
+        if not root.exists():
+            return 0
+        cutoff = time.time() - older_than.total_seconds()
+        stale = [p for p in root.glob("*/*.partial") if p.stat().st_mtime < cutoff]
+        stale += [p for p in root.glob(".scratch/*") if p.stat().st_mtime < cutoff]
+        for p in stale:
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                p.unlink(missing_ok=True)
+        return len(stale)
 
     def scratch_dir(self, source: str) -> Path:
         """Where in-progress downloads go, on the same filesystem as the store."""
@@ -305,9 +328,9 @@ class RawStore:
         self._append(self.manifest_path(source), asdict(capture))
         return capture
 
-    @staticmethod
-    def _append(path: Path, record: Mapping[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+    def _append(self, path: Path, record: Mapping[str, Any]) -> None:
+        _make_dirs(path.parent)
+        new = not path.exists()
         line = json.dumps(record, sort_keys=True) + "\n"
         with path.open("ab") as f:
             # End a line left partial by a crash, so this one stays readable.
@@ -319,19 +342,43 @@ class RawStore:
             # One write call per line, so concurrent appenders don't interleave.
             f.write(line.encode())
             f.flush()
-            os.fsync(f.fileno())
+            _fsync(f.fileno())
+        if new:
+            _sync_dir(path.parent)
+
+
+def _fsync(fd: int) -> None:
+    # On macOS fsync leaves data in the drive's cache; F_FULLFSYNC flushes it.
+    if sys.platform == "darwin":
+        try:
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            return
+        except OSError:
+            pass
+    os.fsync(fd)
 
 
 def _write_synced(path: Path, payload: bytes) -> None:
     with path.open("wb") as f:
         f.write(payload)
         f.flush()
-        os.fsync(f.fileno())
+        _fsync(f.fileno())
 
 
 def _sync_dir(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY)
     try:
-        os.fsync(fd)
+        _fsync(fd)
     finally:
         os.close(fd)
+
+
+def _make_dirs(path: Path) -> None:
+    """mkdir -p, syncing each parent whose listing gained a new directory."""
+    missing = []
+    while not path.exists() and path.parent != path:
+        missing.append(path)
+        path = path.parent
+    for d in reversed(missing):
+        d.mkdir(exist_ok=True)
+        _sync_dir(d.parent)

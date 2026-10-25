@@ -32,7 +32,10 @@ The API pages synchronous queries at 5,000 rows, and offsets stop at 500,000,
 so each partition is captured on its own. A partition's pages are saved
 together, and only after every page has arrived and been checked: the same
 header on each page, the expected number of rows, and the same `record-total`
-throughout (it changes if FINRA republishes mid-capture). Pages come back as
+throughout (it changes when a republication mid-capture changes the row count;
+one that keeps the count is caught by the next run's republish check). A
+partition that comes back empty after holding rows isn't saved: that's
+reported as a failure, so a passing glitch at FINRA can't blank out history. Pages come back as
 CSV, about 2.5 times smaller than JSON.
 
 ### FINRA CDN, Reg SHO files (`capture regsho-daily`, `capture regsho-monthly`)
@@ -86,8 +89,12 @@ and partition list, saved when they change), `cdn/regsho_daily`,
 Text is gzipped on disk, and ZIPs are stored as-is. Nothing is overwritten:
 when a partition or file changes, the new version is saved next to the old one,
 and the manifest says which is newest. Files are written and synced to disk
-first and the manifest line last, so an interrupted capture leaves nothing
-half-recorded. Reads check every file against the SHA-256 in the manifest.
+(F_FULLFSYNC on macOS) first and the manifest line last, so an interrupted capture leaves nothing
+half-recorded; each capture command clears out unfinished folders and
+downloads more than a day old. Reads check every file against the SHA-256 in
+the manifest, and a damaged file is replaced the next time the same data is
+fetched. Daily CDN files are checked against their row-count footer before
+they're saved.
 
 Each Parquet file is built from the newest capture of its inputs and records a
 fingerprint of them and of the build code, so `build` only redoes what
@@ -100,8 +107,10 @@ import pyarrow.parquet as pq
 weekly = pq.read_table("data/parquet/api/weeklySummary")
 ```
 
-Types follow the API metadata in effect when each partition was captured:
-dates become `date32` (timestamps for `otcDailyList`, whose dates carry times),
+Every file of an API dataset has the same columns, every field in any saved
+version of its metadata, so reading the directory loses no column when FINRA
+adds one. A field whose type changes fails the dataset's build. Types follow
+the metadata: dates become `date32` (timestamps for `otcDailyList`, whose dates carry times),
 and numbers become `int64` for counts, ranks, IDs and CRD numbers, otherwise
 `float64` (FINRA reports fractional shares; float64 keeps about 15 significant
 digits). Empty values become null, and so does the NUL or space padding in old
@@ -117,7 +126,7 @@ so a table never mixes in data the raw store has since replaced.
 export FINRA_OTC_DATA=/path/to/data       # default: ./data
 
 finra-otc capture all                     # every API dataset, then regsho-daily
-finra-otc capture api weeklySummary --since 2026-01-01
+finra-otc capture api weeklySummary --since 2026-01-01   # and its details
 finra-otc capture api regShoDaily --refresh-since 2026-10-01   # fetch again
 finra-otc capture regsho-daily --since 2009-08-03
 finra-otc capture regsho-monthly --since 2026-01 --dry-run     # sizes only

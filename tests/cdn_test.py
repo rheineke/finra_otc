@@ -183,3 +183,39 @@ def test_recent_monthly_without_etag_uses_last_modified(tmp_path: Path) -> None:
     headers = {"Last-Modified": "Fri, 09 Oct 2026 10:00:00 GMT"}
     client.routes[url] = response(url, zipped("x.txt", b"e"), headers=headers)
     assert run().saved == 1
+
+
+def test_a_daily_file_cut_short_is_not_saved(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    day = date(2026, 10, 22)
+    url = cdn.daily_url("FORF", day)
+    cut = DAILY.replace(b"\n1\n", b"\n")
+    client = FakeClient(routes={url: response(url, cut)})
+    r = cdn.capture_daily(
+        client, store, since=day, until=day, facilities=["FORF"], now=lambda: at(day)
+    )
+    assert r.failed == 1 and "footer" in r.errors[0]
+    assert store.latest(cdn.DAILY_SOURCE) == {}
+
+
+def test_daily_problem_accepts_crlf_and_empty_files() -> None:
+    assert cdn.daily_problem(DAILY.replace(b"\n", b"\r\n")) is None
+    empty = b"Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market\n0\n"
+    assert cdn.daily_problem(empty) is None
+
+
+def test_a_corrupt_zip_fails_one_file(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    month = date(2026, 9, 1)
+    good = zipped("x.txt", b"data" * 1000)
+    # Damage the deflate stream but keep the ZIP structure.
+    bad = good[:40] + bytes(b ^ 0xFF for b in good[40:60]) + good[60:]
+    urls = [cdn.monthly_url(f, month, None) for f in ("FNYX", "FNRA")]
+    client = FakeClient(
+        routes={urls[0]: response(urls[0], bad), urls[1]: response(urls[1], good)}
+    )
+    r = cdn.capture_monthly(
+        client, store, since=month, facilities=["FNYX", "FNRA"],
+        now=lambda: at(date(2026, 10, 24)),
+    )  # fmt: skip
+    assert (r.failed, r.saved) == (1, 1)

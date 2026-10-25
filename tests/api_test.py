@@ -312,3 +312,45 @@ def test_unchanged_refetch_stops_republished_refetching(tmp_path: Path) -> None:
     # ...but not every day after that.
     day3 = datetime(2026, 10, 26, 16, tzinfo=UTC)
     assert api.capture_dataset(client, store, weekly, now=lambda: day3).planned == 0
+
+
+def test_an_empty_answer_doesnt_replace_rows(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    client = catalog_client(rows(2))
+    api.capture_dataset(client, store, WEEKLY, now=lambda: NOW)
+    client.posts[api.data_url("weeklySummary")] = pager([])
+    r = api.capture_dataset(
+        client, store, WEEKLY, refresh_since=date(2026, 1, 1), now=lambda: NOW
+    )
+    assert r.failed == 1 and "no rows" in r.errors[0]
+    assert store.latest("api/weeklySummary")["2026-09-14_T1"].meta["record_total"] == 2
+
+
+def test_a_damaged_capture_is_replaced_by_an_identical_fetch(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    client = catalog_client(rows(2))
+    api.capture_dataset(client, store, WEEKLY, now=lambda: NOW)
+    first = store.latest("api/weeklySummary")["2026-09-14_T1"]
+    store.path(first.files[0]).write_bytes(b"rot")
+    later = datetime(2026, 10, 25, tzinfo=UTC)
+    r = api.capture_dataset(
+        client, store, WEEKLY, refresh_since=date(2026, 1, 1), now=lambda: later
+    )
+    assert r.saved == 1
+    fresh = store.latest("api/weeklySummary")["2026-09-14_T1"]
+    assert store.read(fresh.files[0]) == csv_page(rows(2))
+
+
+def test_catalog_ignores_request_ids(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    client = catalog_client(rows(1))
+    url = api.partitions_url("weeklySummary")
+    js = {"Content-Type": "application/json"}
+    for request_id in ("a1", "b2"):
+        body = {"message": "No partitions found", "requestId": request_id}
+        client.routes[url] = response(url, json.dumps(body).encode(), headers=js)
+        api.capture_catalog(client, store, "weeklySummary", NOW)
+    partitions = [
+        c for c in store.captures("api_catalog/weeklySummary") if c.key == "partitions"
+    ]
+    assert len(partitions) == 1

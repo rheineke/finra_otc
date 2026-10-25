@@ -123,3 +123,23 @@ def test_absences(tmp_path: Path) -> None:
     store = RawStore(tmp_path)
     store.record_absence("s", "k", "https://x", 403, NOW)
     assert store.absences("s")["k"].status == 403
+
+
+def test_sweep_removes_old_leftovers_only(tmp_path: Path) -> None:
+    import os
+    import time
+
+    store = RawStore(tmp_path)
+    store.save("s", "k", [("f", b"a", {})], now=NOW)
+    old = store.source_dir("s") / "k" / "x.partial"
+    old.mkdir()
+    part = store.scratch_dir("s") / "f.part"
+    part.write_bytes(b"x")
+    fresh = store.scratch_dir("s") / "g.part"
+    fresh.write_bytes(b"x")
+    two_days_ago = time.time() - 2 * 86400
+    for p in (old, part):
+        os.utime(p, (two_days_ago, two_days_ago))
+    assert store.sweep("s") == 2
+    assert not old.exists() and not part.exists() and fresh.exists()
+    assert store.latest("s")

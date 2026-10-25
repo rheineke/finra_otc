@@ -13,9 +13,10 @@ output can't be built, its old file is removed, so readers never see a table
 that no longer matches the raw store. Read a table with, for example,
 ``pyarrow.parquet.read_table("data/parquet/api/weeklySummary")``.
 
-Types follow the API metadata in effect when each partition was captured:
-String to string, Date to date32 (timestamp for the OTC daily list, whose dates
-carry times), and Number to float64, or to int64 for counts, ranks, IDs and CRD
+Every file of an API dataset has the same columns: each field in any saved
+version of the dataset's metadata. Types follow the metadata: String to
+string, Date to date32 (timestamp for the OTC daily list, whose dates carry
+times), and Number to float64, or to int64 for counts, ranks, IDs and CRD
 numbers. Share quantities stay float64 because FINRA reports fractional shares.
 Values are checked as they are converted: a fractional count, a date with a
 time of day, an infinite or NaN number, or text in a number column fails the
@@ -27,7 +28,7 @@ import hashlib
 import io
 import json
 import zipfile
-from bisect import bisect_right
+import zlib
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
@@ -67,6 +68,8 @@ BUILD_ERRORS = (
     EOFError,
     ValueError,  # includes UnicodeDecodeError
     zipfile.BadZipFile,
+    zlib.error,
+    NotImplementedError,  # a ZIP compression method zipfile lacks
 )
 
 
@@ -181,8 +184,11 @@ def _read_strings(content: bytes, delimiter: str, quoted: bool) -> pa.Table:
     names = header_names(content.split(b"\n", 1)[0], delimiter, quoted)
     return pv.read_csv(
         io.BytesIO(content),
+        # Quoted values may hold line breaks.
         parse_options=pv.ParseOptions(
-            delimiter=delimiter, quote_char='"' if quoted else False
+            delimiter=delimiter,
+            quote_char='"' if quoted else False,
+            newlines_in_values=quoted,
         ),
         convert_options=string_options(names),
     )
@@ -275,28 +281,40 @@ def build_api_partition(
     return table
 
 
-class Schemas:
-    """The schema from the metadata in effect when each capture was made.
+def dataset_schema(store: RawStore, dataset: str) -> pa.Schema:
+    """One schema for every file of a dataset: each field FINRA has ever listed.
 
-    A capture older than every saved metadata uses the oldest one.
+    Each partition's file gets the same columns, null where its capture lacks
+    them, so reading the dataset as a directory loses nothing. A field whose
+    type changed between metadata versions fails the dataset.
     """
+    found = sorted(
+        (c for c in store.captures(f"api_catalog/{dataset}") if c.key == "metadata"),
+        key=lambda c: c.captured_at,
+    )
+    types: dict[str, pa.DataType] = {}
+    for capture in found:
+        for f in api_schema(dataset, json.loads(store.read(capture.files[0]))):
+            if f.name in types and types[f.name] != f.type:
+                raise BuildError(
+                    f"{f.name} changed type from {types[f.name]} to {f.type}"
+                )
+            types.setdefault(f.name, f.type)
+    if not types:
+        raise BuildError("no metadata captured")
+    return pa.schema([pa.field(name, t) for name, t in types.items()])
 
-    def __init__(self, store: RawStore, dataset: str) -> None:
-        source = f"api_catalog/{dataset}"
-        found = sorted(
-            (c for c in store.captures(source) if c.key == "metadata"),
-            key=lambda c: c.captured_at,
-        )
-        self.times = [c.captured_at for c in found]
-        self.schemas = [
-            api_schema(dataset, json.loads(store.read(c.files[0]))) for c in found
-        ]
 
-    def __bool__(self) -> bool:
-        return bool(self.schemas)
-
-    def at(self, captured_at: str) -> pa.Schema:
-        return self.schemas[max(0, bisect_right(self.times, captured_at) - 1)]
+def _remove_stale(path: Path, capture: Capture) -> None:
+    """Remove an output that was built from an older capture than ``capture``."""
+    if not path.exists():
+        return
+    try:
+        inputs = json.loads((pq.read_schema(path).metadata or {}).get(INPUTS, b"[]"))
+    except BUILD_ERRORS:
+        inputs = []
+    if [i.get("captured_at") for i in inputs] != [capture.captured_at]:
+        path.unlink()
 
 
 def build_api(
@@ -312,19 +330,18 @@ def build_api(
         captures = store.latest(source)
         if not captures:
             continue
+        out = parquet_dir(store) / "api" / dataset
         try:
-            schemas = Schemas(store, dataset)
+            schema = dataset_schema(store, dataset)
         except BUILD_ERRORS as e:
+            # Nothing can be built; drop outputs the raw store has moved past.
+            for key, capture in captures.items():
+                _remove_stale(out / f"{key}.parquet", capture)
             result.failed += 1
             result.errors.append(f"metadata: {e}")
             continue
-        if not schemas:
-            result.failed += 1
-            result.errors.append("no metadata captured")
-            continue
         for key, capture in sorted(captures.items()):
-            path = parquet_dir(store) / "api" / dataset / f"{key}.parquet"
-            schema = schemas.at(capture.captured_at)
+            path = out / f"{key}.parquet"
             print_ = fingerprint([capture], schema.to_string())
             write = partial(_write_api, store, capture, schema, path, print_)
             build_one(result, path, print_, f"{source} {key}", write, progress)
