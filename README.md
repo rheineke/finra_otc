@@ -140,9 +140,11 @@ is dropped at the next append. Each capture command deletes unfinished folders
 and downloads more than a day old. Finished folders that no manifest line
 names (a crash just before the manifest append, or a manifest restored from
 an older backup) are never touched; `status` lists them. Each is a complete
-capture, so it can be recovered by appending its line back to the manifest.
-Reads
-check every file against the SHA-256 in the manifest. A damaged file is
+capture and keeps a copy of its manifest line (`.capture.json`), so
+`finra-otc status --recover` checks its files against it and records it
+again. Captures can run alongside each other, since manifest appends are
+locked; a `build` started while another runs on the same data folder exits
+with status 1. Reads check every file against the SHA-256 in the manifest. A damaged file is
 replaced the next time the same data is fetched: on any run for recent data,
 or with `--refresh-since` for older data (monthly ZIPs are only size-checked
 at capture; the build verifies their hash). Daily CDN files are checked
@@ -227,4 +229,5 @@ pip install -e ".[dev,test]"
 pytest
 ```
 
-CI and pre-commit run ruff (lint and format), mypy, codespell and the tests.
+CI runs ruff (lint and format), mypy, codespell and the tests. pre-commit runs
+the same checks except the tests.

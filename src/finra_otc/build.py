@@ -10,7 +10,9 @@ rebuilt only when those inputs or its builder's version change: a fingerprint
 of both is stored in the file's metadata. Files are written under a
 hidden temporary name (which dataset readers skip) and then renamed. When an
 output can't be built, its old file is removed, so readers never see a table
-that no longer matches the raw store. Read a table with, for example,
+that no longer matches the raw store. A build holds a lock on the parquet
+folder (see ``exclusive``), so two builds never write the same outputs. Read a
+table with, for example,
 ``pyarrow.parquet.read_table("data/parquet/api/weeklySummary")``.
 
 Every file of an API dataset has the same columns: each field in any saved
@@ -24,6 +26,7 @@ build of that file instead of being altered.
 """
 
 import csv
+import fcntl
 import hashlib
 import io
 import json
@@ -31,6 +34,7 @@ import zipfile
 import zlib
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date
 from functools import partial
@@ -92,8 +96,29 @@ class Result:
     warnings: list[str] = field(default_factory=list)
 
 
+class BuildLocked(RuntimeError):
+    """Another build holds the parquet folder."""
+
+
 def parquet_dir(store: RawStore) -> Path:
     return store.root / "parquet"
+
+
+@contextmanager
+def exclusive(store: RawStore) -> Iterator[None]:
+    """Hold the parquet folder's lock for a build; raise BuildLocked if taken.
+
+    Two builds at once would write the same temporary files, and one's failure
+    would remove the output the other had just written.
+    """
+    out = parquet_dir(store)
+    out.mkdir(parents=True, exist_ok=True)
+    with (out / ".lock").open("a") as f:  # hidden: dataset readers skip it
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise BuildLocked(f"another build is running on {out}") from None
+        yield
 
 
 def fingerprint(inputs: Iterable[Capture], version: int, extra: Any = None) -> str:

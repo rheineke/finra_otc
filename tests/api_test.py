@@ -1,6 +1,7 @@
 import json
 import threading
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -439,3 +440,89 @@ def test_accept_empty(tmp_path: Path) -> None:
         now=lambda: NOW.replace(hour=17),
     )
     assert r.saved == 1
+
+
+def test_fetch_partition_detects_a_changed_header() -> None:
+    inner = pager(rows(5))
+
+    def handle(body: Mapping[str, Any] | None) -> HttpResponse:
+        assert body is not None
+        r = inner(body)
+        if body["offset"]:
+            renamed = r.content.replace(b'"MPID"', b'"mpid"', 1)
+            return HttpResponse(r.url, r.status, r.headers, renamed)
+        return r
+
+    client = FakeClient(posts={api.data_url("weeklySummary"): handle})
+    with pytest.raises(api.CaptureError, match="header changed at 3"):
+        api.fetch_partition(client, WEEKLY, FIELDS, VALUES)
+
+
+def test_a_partition_republished_mid_capture_is_fetched_again(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    client = catalog_client(rows(7))
+    before, after = pager(rows(7)), pager(rows(8))
+    offsets: list[int] = []
+
+    def republished(body: Mapping[str, Any] | None) -> HttpResponse:
+        assert body is not None
+        offsets.append(body["offset"])
+        # FINRA adds a row after the first page: record-total goes 7 -> 8.
+        return before(body) if len(offsets) == 1 else after(body)
+
+    client.posts[api.data_url("weeklySummary")] = republished
+    r = api.capture_dataset(client, store, WEEKLY, now=lambda: NOW)
+    assert (r.saved, r.failed) == (1, 0)
+    assert offsets == [0, 3, 0, 3, 6]
+    capture = store.latest("api/weeklySummary")["2026-09-14_T1"]
+    assert capture.meta["record_total"] == 8
+
+
+@dataclass
+class CancellableClient(FakeClient):
+    """Has the event RequestsClient's retry waits watch."""
+
+    cancelled: threading.Event = field(default_factory=threading.Event)
+
+
+def test_an_error_stops_the_fetches_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = RawStore(tmp_path)
+    parts = {
+        "availablePartitions": [
+            {"partitions": ["2026-09-14", "T1"]},
+            {"partitions": ["2026-09-21", "T1"]},
+        ]
+    }
+    routes = catalog_client([]).routes
+    routes[api.partitions_url("weeklySummary")] = response(
+        "p", json.dumps(parts).encode(), headers={"Content-Type": "application/json"}
+    )
+    client = CancellableClient(routes=routes)
+    one, seven = pager(rows(1)), pager(rows(7, week="2026-09-21"))
+    slow_started = threading.Event()
+    slow_offsets: list[int] = []
+
+    def handle(body: Mapping[str, Any] | None) -> HttpResponse:
+        assert body is not None
+        if body["compareFilters"][0]["fieldValue"] == "2026-09-21":
+            slow_offsets.append(body["offset"])
+            slow_started.set()
+            client.cancelled.wait(10)  # answers once the capture is stopping
+            return seven(body)
+        slow_started.wait(10)
+        return one(body)
+
+    client.posts[api.data_url("weeklySummary")] = handle
+    real_save = store.save
+
+    def save(source: str, key: str, files: Any, **kwargs: Any) -> Any:
+        if source == "api/weeklySummary":
+            raise OSError("disk full")
+        return real_save(source, key, files, **kwargs)
+
+    monkeypatch.setattr(store, "save", save)
+    with pytest.raises(OSError, match="disk full"):
+        api.capture_dataset(client, store, WEEKLY, now=lambda: NOW, workers=2)
+    assert slow_offsets == [0]  # stopped before its next page

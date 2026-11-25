@@ -1,5 +1,7 @@
+import fcntl
 import gzip
 import hashlib
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -162,3 +164,59 @@ def test_sweep_leaves_unrecorded_capture_folders(tmp_path: Path) -> None:
     assert store.sweep("s") == 0
     assert orphan.exists() and store.read(kept.files[0]) == b"a"
     assert store.unrecorded("s") == [orphan]
+
+
+def test_saves_wait_for_the_manifest_lock(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    store.save("s", "k", [("f", b"a", {})], now=NOW)
+    saver = threading.Thread(target=store.save, args=("s", "k2", [("f", b"b", {})]))
+    with store.manifest_path("s").open("ab") as other:
+        fcntl.flock(other.fileno(), fcntl.LOCK_EX)  # another process appending
+        saver.start()
+        saver.join(0.3)
+        # Waiting, with its folder not yet in place: it appears with its line.
+        assert saver.is_alive()
+        assert store.unrecorded("s") == [] and list(store.latest("s")) == ["k"]
+    saver.join(5)
+    assert not saver.is_alive() and set(store.latest("s")) == {"k", "k2"}
+
+
+def test_checks_wait_for_the_lock_too(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    store.record_check("s", "k", NOW)
+    checker = threading.Thread(target=store.record_check, args=("s", "k2", NOW))
+    with store.checks_path("s").open("ab") as other:
+        fcntl.flock(other.fileno(), fcntl.LOCK_EX)
+        checker.start()
+        checker.join(0.3)
+        assert checker.is_alive() and set(store.checks("s")) == {"k"}
+    checker.join(5)
+    assert set(store.checks("s")) == {"k", "k2"}
+
+
+def test_recover_records_a_lost_manifest_line_again(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    kept = store.save("s", "k", [("f", b"a", {})], meta={"rows": 1}, now=NOW)
+    lost = store.save(
+        "s", "k2", [("f", b"b", {"rows": 1}), ("g", b"c", {})], meta={"total": 2}
+    )
+    manifest = store.manifest_path("s")
+    manifest.write_text(manifest.read_text().splitlines(keepends=True)[0])
+    folder = store.path(lost.files[0]).parent
+    assert store.unrecorded("s") == [folder]
+    assert store.recover("s") == ([lost], [])
+    assert store.latest("s") == {"k": kept, "k2": lost}
+    assert store.unrecorded("s") == [] and store.recover("s") == ([], [])
+
+
+def test_recover_leaves_folders_it_cant_check(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    damaged = store.save("s", "k", [("f", b"a", {})], now=NOW)
+    store.path(damaged.files[0]).write_bytes(gzip.compress(b"x"))
+    bare = store.source_dir("s") / "k" / "20260101T000000000000Z"
+    bare.mkdir()
+    (bare / "f.gz").write_bytes(gzip.compress(b"a"))  # no record kept with it
+    store.manifest_path("s").write_text("")
+    recorded, left = store.recover("s")
+    assert recorded == [] and set(left) == {bare, store.path(damaged.files[0]).parent}
+    assert store.latest("s") == {}

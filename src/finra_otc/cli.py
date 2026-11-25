@@ -110,7 +110,14 @@ def get_parser() -> argparse.ArgumentParser:
         "--force", action="store_true", help="rebuild even outputs that are current"
     )
 
-    sub.add_parser("status", help="what is in the raw store and the Parquet tables")
+    st = sub.add_parser(
+        "status", help="what is in the raw store and the Parquet tables"
+    )
+    st.add_argument(
+        "--recover",
+        action="store_true",
+        help="record again capture folders that no manifest line names",
+    )
     return p
 
 
@@ -214,14 +221,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.command == "build":
         parts = args.parts or (["api"] if args.dataset else BUILD_PARTS)
         results: list[build.Result] = []
-        if "api" in parts:
-            results += build.build_api(store, args.dataset, progress, args.force)
-        if "regsho-daily" in parts:
-            results.append(build.build_daily(store, progress, args.force))
-        if "regsho-monthly" in parts:
-            results.append(build.build_monthly(store, progress, args.force))
-        if "legacy" in parts:
-            results.append(build.build_legacy(store, progress, args.force))
+        try:
+            with build.exclusive(store):
+                if "api" in parts:
+                    results += build.build_api(
+                        store, args.dataset, progress, args.force
+                    )
+                if "regsho-daily" in parts:
+                    results.append(build.build_daily(store, progress, args.force))
+                if "regsho-monthly" in parts:
+                    results.append(build.build_monthly(store, progress, args.force))
+                if "legacy" in parts:
+                    results.append(build.build_legacy(store, progress, args.force))
+        except build.BuildLocked as e:
+            failures += _report([str(e)])
         for b in results:
             if b.built or b.current or b.failed:
                 print(
@@ -232,7 +245,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             for w in b.warnings:
                 print(f"  warning: {b.source}: {w}", file=sys.stderr)
     elif args.command == "status":
-        status(store)
+        failures += status(store, recover=args.recover)
     return 1 if failures else 0
 
 
@@ -252,17 +265,30 @@ def _report(errors: list[str]) -> int:
     return len(errors)
 
 
-def status(store: RawStore) -> None:
+def status(store: RawStore, recover: bool = False) -> int:
+    """Print the store's contents; return how many folders stay unrecorded."""
+    recovered: list[str] = []
+    unrecorded: list[Path] = []
+    for source in store.sources():
+        if recover:
+            done, left = store.recover(source)
+            recovered += [f"{c.source} {c.key} {c.captured_at}" for c in done]
+            unrecorded += left
+        else:
+            unrecorded += store.unrecorded(source)
     print(f"{'source':38} {'keys':>7} {'captures':>9} {'stored MB':>10}")
-    unrecorded = []
     for source in store.sources():
         captures = list(store.captures(source))
         keys = {c.key for c in captures}
         stored = sum(f.stored_bytes for c in captures for f in c.files)
         print(f"{source:38} {len(keys):>7,} {len(captures):>9,} {stored / 1e6:>10,.1f}")
-        unrecorded += store.unrecorded(source)
+    if recovered:
+        print(f"\nrecorded again: {len(recovered)} capture folders")
+        for line in recovered[:20]:
+            print(f"  {line}")
     if unrecorded:
-        print(f"\n{len(unrecorded)} capture folders no manifest names (see README):")
+        hint = "can't be recovered" if recover else "run status --recover"
+        print(f"\n{len(unrecorded)} capture folders no manifest names ({hint}):")
         for folder in unrecorded[:20]:
             print(f"  {folder}")
     out = build.parquet_dir(store)
@@ -270,6 +296,7 @@ def status(store: RawStore) -> None:
         files = list(out.glob("**/*.parquet"))
         size = sum(f.stat().st_size for f in files)
         print(f"\nparquet: {len(files):,} files, {size / 1e6:,.1f} MB in {out}")
+    return len(unrecorded) if recover else 0
 
 
 if __name__ == "__main__":

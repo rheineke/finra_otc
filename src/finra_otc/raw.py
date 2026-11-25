@@ -3,6 +3,7 @@
 Layout under the data directory:
 
     raw/<source>/<key>/<captured_at>/<file>[.gz]
+    raw/<source>/<key>/<captured_at>/.capture.json  # the capture's manifest line
     raw/<source>/manifest.jsonl     # one line per complete capture of a key
     raw/<source>/absent.jsonl       # keys checked and found missing (CDN only)
     raw/<source>/checks.jsonl       # keys fetched again and found unchanged
@@ -16,6 +17,7 @@ Text is gzip-compressed on disk; gunzipping returns the bytes exactly as
 received. Files that are already compressed (ZIPs) are stored as-is. Files are
 written and synced to disk (F_FULLFSYNC on macOS) first and the manifest line
 last, so a capture missing from the manifest is incomplete and is ignored.
+Appends hold a lock on the file, so several processes can capture at once.
 Reads check each file against the SHA-256 in the manifest. Nothing is ever
 overwritten.
 """
@@ -32,15 +34,19 @@ import time
 import warnings
 import zlib
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 DATA_DIR_ENV = "FINRA_OTC_DATA"
 
 # Keys and file names become path components.
 _SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._=-]*")
+# A copy of the capture's manifest line, in its folder. Saved file names can't
+# start with ".", so it never collides with one.
+CAPTURE_RECORD = ".capture.json"
 
 
 def data_dir() -> Path:
@@ -304,7 +310,7 @@ class RawStore:
 
         A crash between the rename and the manifest append leaves one, and so
         does a manifest restored from an older backup or damaged. Each is a
-        complete capture; nothing reads it until it's recorded again.
+        complete capture; nothing reads it until ``recover`` records it again.
         """
         root = self.source_dir(source)
         recorded = {
@@ -319,6 +325,48 @@ class RawStore:
             and not folder.name.endswith(".partial")
             and folder not in recorded
         )
+
+    def recover(self, source: str) -> tuple[list[Capture], list[Path]]:
+        """Record again the unrecorded folders whose files match their record.
+
+        Returns (recorded, left). Folders without a readable record, or whose
+        files don't match it, are left alone and keep being listed.
+        """
+        recorded: list[Capture] = []
+        left: list[Path] = []
+        # Under the manifest's lock, so a capture committing now isn't recorded
+        # twice: its folder appears only with its manifest line.
+        with self._locked(self.manifest_path(source)) as manifest:
+            for folder in self.unrecorded(source):
+                capture = self._folder_capture(source, folder)
+                if capture is None:
+                    left.append(folder)
+                    continue
+                _write_line(manifest, asdict(capture))
+                recorded.append(capture)
+        return recorded, left
+
+    def _folder_capture(self, source: str, folder: Path) -> Capture | None:
+        try:
+            record = json.loads((folder / CAPTURE_RECORD).read_bytes())
+            record["files"] = [StoredFile(**f) for f in record["files"]]
+            capture = Capture(**record)
+            stamp = datetime.fromisoformat(capture.captured_at)
+            if (
+                capture.source != source
+                or self.capture_dir(source, capture.key, stamp) != folder
+            ):
+                return None
+            for f in capture.files:
+                if self.path(f).parent != folder:
+                    return None
+                if f.path.endswith(".gz"):
+                    self.read(f)
+                else:
+                    self.verify(f)
+        except OSError, ValueError, TypeError, KeyError:
+            return None  # no record, a damaged one, or damaged files
+        return capture
 
     def scratch_dir(self, source: str) -> Path:
         """Where in-progress downloads go, on the same filesystem as the store."""
@@ -336,9 +384,6 @@ class RawStore:
         meta: Mapping[str, Any] | None,
         now: datetime,
     ) -> Capture:
-        _sync_dir(tmp)
-        tmp.rename(folder)
-        _sync_dir(folder.parent)
         capture = Capture(
             source=source,
             key=key,
@@ -346,29 +391,52 @@ class RawStore:
             files=stored,
             meta=dict(meta or {}),
         )
-        self._append(self.manifest_path(source), asdict(capture))
+        record = asdict(capture)
+        # Kept with the files too, so a lost manifest line can be recovered.
+        _write_synced(tmp / CAPTURE_RECORD, _line(record))
+        _sync_dir(tmp)
+        with self._locked(self.manifest_path(source)) as manifest:
+            tmp.rename(folder)
+            _sync_dir(folder.parent)
+            _write_line(manifest, record)
         return capture
 
     def _append(self, path: Path, record: Mapping[str, Any]) -> None:
+        with self._locked(path) as f:
+            _write_line(f, record)
+
+    @contextmanager
+    def _locked(self, path: Path) -> Iterator[BinaryIO]:
+        """``path`` open for appending, locked against other appenders.
+
+        Without the lock, one process could drop a torn last line while another
+        appends, cutting off the other's record.
+        """
         _make_dirs(path.parent)
         new = not path.exists()
-        line = json.dumps(record, sort_keys=True) + "\n"
-        if path.exists() and path.stat().st_size > 0:
-            with path.open("rb+") as r:
-                r.seek(-1, os.SEEK_END)
-                if r.read(1) != b"\n":
+        with path.open("ab+") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            if f.seek(0, os.SEEK_END) > 0:
+                f.seek(-1, os.SEEK_END)
+                if f.read(1) != b"\n":
                     # A crash mid-append left a partial record: drop it.
-                    r.seek(0)
-                    data = r.read()
-                    r.truncate(data.rfind(b"\n") + 1)
-                    _fsync(r.fileno())
-        with path.open("ab") as f:
-            # One write call per line, so concurrent appenders don't interleave.
-            f.write(line.encode())
-            f.flush()
-            _fsync(f.fileno())
+                    f.seek(0)
+                    data = f.read()
+                    f.truncate(data.rfind(b"\n") + 1)
+                    _fsync(f.fileno())
+            yield f
         if new:
             _sync_dir(path.parent)
+
+
+def _line(record: Mapping[str, Any]) -> bytes:
+    return (json.dumps(record, sort_keys=True) + "\n").encode()
+
+
+def _write_line(f: BinaryIO, record: Mapping[str, Any]) -> None:
+    f.write(_line(record))  # opened for appending: always at the end
+    f.flush()
+    _fsync(f.fileno())
 
 
 def _older(path: Path, cutoff: float) -> bool:

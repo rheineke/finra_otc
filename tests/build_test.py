@@ -495,3 +495,12 @@ def test_partition_fields_come_from_the_newest_metadata(tmp_path: Path) -> None:
     )
     [r] = build.build_api(store, ["weeklySummary"])
     assert (r.built, r.warnings) == (1, [])
+
+
+def test_a_second_build_is_refused_while_one_runs(tmp_path: Path) -> None:
+    store = RawStore(tmp_path)
+    with build.exclusive(store):
+        with pytest.raises(build.BuildLocked), build.exclusive(store):
+            pass
+    with build.exclusive(store):  # released
+        pass
